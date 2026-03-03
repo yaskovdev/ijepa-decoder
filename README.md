@@ -33,15 +33,15 @@ Extract the images (TODO: specify the URL to the dataset) to a `/home/yaskovdev/
 ```shell
 # Run the below commands on the Linux machine.
 
-export MODEL_FLAGS_128="--attention_resolutions 32,16,8 --class_cond False --diffusion_steps 1000 --image_size 128 --learn_sigma True --noise_schedule linear --num_channels 256 --num_heads 4 --num_res_blocks 2 --resblock_updown True --use_fp16 False --use_scale_shift_norm True"
+export MODEL_FLAGS_64="--attention_resolutions 32,16,8 --class_cond False --diffusion_steps 1000 --image_size 64 --learn_sigma True --noise_schedule linear --num_channels 256 --num_heads 4 --num_res_blocks 2 --resblock_updown True --use_fp16 False --use_scale_shift_norm True"
 export TRAIN_FLAGS="--lr 1e-4 --batch_size 8"
 
-python scripts/image_train.py $MODEL_FLAGS_128 $TRAIN_FLAGS --feat_cond --data_dir /home/yaskovdev/images --type_model dino --out_dir /home/yaskovdev/save_dir
+python scripts/image_train.py $MODEL_FLAGS_64 $TRAIN_FLAGS --feat_cond --data_dir /home/yaskovdev/images --type_model dino --out_dir /home/yaskovdev/save_dir_64
 
 # If you interrupted the training earlier, you can resume by passing resume_checkpoint
 
 # Sample from the trained model:
-python scripts/image_sample.py $MODEL_FLAGS_128 --batch_size 8 --num_images 1 --timestep_respacing 100 --data_dir "/home/yaskovdev/rcdm_images" --model_path /home/yaskovdev/save_dir/model010000.pt --type_model dino
+python scripts/image_sample.py $MODEL_FLAGS_64 --batch_size 8 --num_images 1 --timestep_respacing 100 --data_dir "/home/yaskovdev/rcdm_images" --model_path /home/yaskovdev/save_dir/model010000.pt --type_model dino
 ```
 
 ## Sample on Windows
