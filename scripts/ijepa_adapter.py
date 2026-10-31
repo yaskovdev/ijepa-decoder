@@ -92,7 +92,8 @@ def load_dino_cache(path, predictor_cache):
             or cache.get("image_hashes") != predictor_cache.get("image_hashes")):
         raise ValueError("DINO targets do not match the predictor images, checkpoint, or hidden boxes.")
     features = cache["features"]
-    if (features.ndim != 2 or features.shape[0] != len(predictor_cache["features"])
+    if (not isinstance(features, th.Tensor) or features.ndim != 2
+            or features.shape[0] != len(predictor_cache["features"])
             or not features.is_floating_point() or not th.isfinite(features).all()
             or (features < 0).any()):
         raise ValueError("DINO targets must be finite, nonnegative paired feature vectors.")
@@ -103,20 +104,34 @@ def load_dino_cache(path, predictor_cache):
     return cache
 
 
+def source_features(cache, source):
+    if source == "predictor":
+        return cache["features"]
+    if source != "target":
+        raise ValueError("Feature source must be predictor or target.")
+    if "target_features" not in cache or cache.get("target_normalization") != "layer_norm_patch_tokens":
+        raise ValueError("Target adapters require cached per-token-normalized target-encoder features.")
+    return cache["target_features"]
+
+
 @th.no_grad()
-def adapter_metrics(model, features, targets):
+def adapter_metrics(model, features, targets, wrong_indices=None, output_scale=None):
     prediction = model(features)
+    wrong = prediction.roll(1, 0) if wrong_indices is None else prediction[wrong_indices]
+    scale = model.output_scale if output_scale is None else output_scale
     return dict(
-        mse=(((prediction - targets) / model.output_scale) ** 2).mean().item(),
-        wrong_mse=(((prediction.roll(1, 0) - targets) / model.output_scale) ** 2).mean().item(),
+        mse=(((prediction - targets) / scale) ** 2).mean().item(),
+        wrong_mse=(((wrong - targets) / scale) ** 2).mean().item(),
         cosine=F.cosine_similarity(prediction, targets).mean().item(),
-        wrong_cosine=F.cosine_similarity(prediction.roll(1, 0), targets).mean().item(),
+        wrong_cosine=F.cosine_similarity(wrong, targets).mean().item(),
     )
 
 
 def train(args):
     if args.steps <= 0 or args.lr <= 0 or args.weight_decay < 0 or args.log_interval <= 0:
         raise ValueError("Use positive steps, learning rate, logging interval, and nonnegative weight decay.")
+    if args.kind == "ridge" and (not np.isfinite(args.ridge_alpha) or args.ridge_alpha <= 0):
+        raise ValueError("Ridge alpha must be finite and positive.")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     if (out_dir / "adapter_config.json").exists() or (out_dir / "best.pt").exists():
@@ -133,6 +148,8 @@ def train(args):
             or dino["train"]["dino_spec"] != dino["val"]["dino_spec"]
             or dino["train"]["features"].shape[1] != dino["val"]["features"].shape[1]):
         raise ValueError("Train and validation features must use the same frozen models and geometry.")
+    if set(predictor["train"].get("image_hashes", [])) & set(predictor["val"].get("image_hashes", [])):
+        raise ValueError("Train and validation contain the same original image.")
     if not 0 < args.batch_size <= len(predictor["train"]["features"]):
         raise ValueError("Batch size must be positive and no larger than the training dataset.")
     if len(predictor["val"]["features"]) < 2:
@@ -140,44 +157,58 @@ def train(args):
     device = configure(args)
     input_dim = predictor["train"]["features"].shape[1]
     output_dim = dino["train"]["features"].shape[1]
-    model = PredictorAdapter(input_dim, output_dim, args.hidden_dim)
-    model.fit_statistics(predictor["train"]["features"], dino["train"]["features"])
+    hidden_dim = 0 if args.kind == "ridge" else args.hidden_dim
+    steps = 1 if args.kind == "ridge" else args.steps
+    model = PredictorAdapter(input_dim, output_dim, hidden_dim, args.dropout)
+    inputs = {split: source_features(cache, args.feature_source) for split, cache in predictor.items()}
+    model.fit_statistics(inputs["train"], dino["train"]["features"])
     model.to(device)
-    features = {split: cache["features"].float().to(device) for split, cache in predictor.items()}
+    features = {split: values.float().to(device) for split, values in inputs.items()}
     targets = {split: cache["features"].float().to(device) for split, cache in dino.items()}
-    optimizer = th.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = th.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.steps)
+    wrong_indices = th.tensor([different_image_index(predictor["val"], index, -1)
+                               for index in range(len(features["val"]))], device=device)
+    if args.kind == "mlp":
+        optimizer = th.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        scheduler = th.optim.lr_scheduler.CosineAnnealingLR(optimizer, steps)
     config = dict(
-        input_dim=input_dim, output_dim=output_dim, hidden_dim=args.hidden_dim,
+        input_dim=input_dim, output_dim=output_dim, hidden_dim=hidden_dim,
         feature_spec=feature_spec(predictor["train"]), dino_spec=dino["train"]["dino_spec"],
-        seed=args.seed, steps=args.steps, batch_size=args.batch_size,
-        lr=args.lr, weight_decay=args.weight_decay,
+        seed=args.seed, steps=steps, batch_size=args.batch_size,
+        lr=args.lr, weight_decay=args.weight_decay, dropout=args.dropout,
+        kind=args.kind, ridge_alpha=args.ridge_alpha, feature_source=args.feature_source,
+        target_normalization=predictor["train"].get("target_normalization") if args.feature_source == "target" else None,
+        training_examples=len(features["train"]), training_images=len(set(predictor["train"]["paths"])),
+        validation_examples=len(features["val"]), validation_images=len(set(predictor["val"]["paths"])),
     )
     (out_dir / "adapter_config.json").write_text(json.dumps(config, indent=2) + "\n")
     model.eval()
-    baseline = adapter_metrics(model, features["val"], targets["val"])
+    baseline = adapter_metrics(model, features["val"], targets["val"], wrong_indices)
     print(f"Mean-feature baseline: {baseline}", flush=True)
     history = [dict(step=0, validation=baseline)]
     best = baseline["mse"]
     generator = th.Generator().manual_seed(args.seed)
     started = time.monotonic()
-    for step in range(1, args.steps + 1):
-        model.train()
-        indices = th.randint(len(features["train"]), (args.batch_size,), generator=generator).to(device)
-        prediction = model(features["train"][indices])
-        loss = (((prediction - targets["train"][indices]) / model.output_scale) ** 2).mean()
-        if not th.isfinite(loss):
-            raise FloatingPointError("Adapter training loss is not finite.")
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
-        if step % args.log_interval == 0 or step == args.steps:
+    for step in range(1, steps + 1):
+        loss = None
+        if args.kind == "ridge":
+            model.fit_ridge(features["train"], targets["train"], args.ridge_alpha)
+        else:
+            model.train()
+            indices = th.randint(len(features["train"]), (args.batch_size,), generator=generator).to(device)
+            prediction = model(features["train"][indices])
+            loss = (((prediction - targets["train"][indices]) / model.output_scale) ** 2).mean()
+            if not th.isfinite(loss):
+                raise FloatingPointError("Adapter training loss is not finite.")
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+        if step % args.log_interval == 0 or step == steps:
             model.eval()
-            metrics = adapter_metrics(model, features["val"], targets["val"])
+            metrics = adapter_metrics(model, features["val"], targets["val"], wrong_indices)
             if not all(np.isfinite(value) for value in metrics.values()):
                 raise FloatingPointError("Adapter validation metrics are not finite.")
-            history.append(dict(step=step, training_mse=loss.item(), validation=metrics))
+            history.append(dict(step=step, training_mse=loss.item() if loss is not None else None, validation=metrics))
             payload = dict(config, state_dict={key: value.detach().cpu()
                                               for key, value in model.state_dict().items()},
                            completed_steps=step, validation=metrics)
@@ -186,7 +217,7 @@ def train(args):
                 best = metrics["mse"]
                 save_cache(payload, out_dir / "best.pt")
             (out_dir / "metrics.json").write_text(json.dumps(history, indent=2) + "\n")
-            print(f"step {step}/{args.steps}: {metrics}, "
+            print(f"step {step}/{steps}: {metrics}, "
                   f"elapsed {time.monotonic() - started:.1f}s", flush=True)
     if not (out_dir / "best.pt").exists():
         raise RuntimeError("Adapter did not improve on mean DINO features; inspect last.pt and metrics.json.")
@@ -199,8 +230,14 @@ def load_adapter(path, predictor_cache, dino_spec, device):
             or checkpoint["dino_spec"] != dino_spec
             or checkpoint["input_dim"] != predictor_cache["features"].shape[1]):
         raise ValueError("Adapter checkpoint does not match the frozen predictor or DINO feature extraction.")
-    model = PredictorAdapter(checkpoint["input_dim"], checkpoint["output_dim"], checkpoint["hidden_dim"])
+    source = checkpoint.get("feature_source", "predictor")
+    if source not in ("predictor", "target") or (
+            source == "target" and checkpoint.get("target_normalization") != "layer_norm_patch_tokens"):
+        raise ValueError("Adapter checkpoint has an incompatible target-feature normalization or source.")
+    model = PredictorAdapter(checkpoint["input_dim"], checkpoint["output_dim"], checkpoint["hidden_dim"],
+                             checkpoint.get("dropout", 0.1))
     model.load_state_dict(checkpoint["state_dict"], strict=True)
+    model.feature_source = source
     return model.to(device).eval().requires_grad_(False)
 
 
@@ -229,27 +266,42 @@ def sample(args):
     dino = load_dino_cache(args.dino_cache, cache)
     if len(cache["features"]) < 2 or dino["features"].shape[1] != 2048:
         raise ValueError("The released prior needs 2048-dimensional features and two images for controls.")
-    if args.oracle_only and args.adapter:
-        raise ValueError("Choose either an adapter or the oracle-only decoder check.")
+    if args.oracle_only and (args.adapter or args.target_adapter or args.reference_adapter):
+        raise ValueError("Choose either adapters or the oracle-only decoder check.")
     if not args.oracle_only and not args.adapter:
         raise ValueError("Supply --adapter for predictor decoding, or --oracle-only for the baseline.")
     device = configure(args)
     adapter = None if args.oracle_only else load_adapter(args.adapter, cache, dino["dino_spec"], device)
-    if adapter is not None and adapter.output_mean.numel() != 2048:
-        raise ValueError("The released prior requires 2048-dimensional DINO conditioning.")
+    target_adapter = load_adapter(args.target_adapter, cache, dino["dino_spec"], device) if args.target_adapter else None
+    reference_adapter = load_adapter(args.reference_adapter, cache, dino["dino_spec"], device) if args.reference_adapter else None
+    for candidate in (adapter, target_adapter, reference_adapter):
+        if candidate is not None and candidate.output_mean.numel() != 2048:
+            raise ValueError("The released prior requires 2048-dimensional DINO conditioning.")
+    if target_adapter is not None and target_adapter.feature_source != "target":
+        raise ValueError("The target-encoder oracle requires an adapter trained with --feature-source target.")
+    target_inputs = source_features(cache, "target") if target_adapter is not None else None
     model, diffusion = load_prior(args.rcdm_checkpoint, device, args.sampling_steps)
-    features = dino["features"].to(device) if adapter is None else adapter(cache["features"].to(device))
+    predictor_features = cache["features"].float().to(device)
+    features = dino["features"].float().to(device) if adapter is None else adapter(predictor_features)
+    target_oracle = target_adapter(target_inputs.float().to(device)) if target_adapter is not None else None
+    via_target = target_adapter(predictor_features) if target_adapter is not None else None
+    reference = reference_adapter(predictor_features) if reference_adapter is not None else None
     indices = distinct_examples(cache, args.num_images)
     count = len(indices)
     prefix = "oracle" if adapter is None else "predictor"
     labels = ["original", "context", "target"]
     if adapter is not None:
         labels.append("DINO oracle")
+    if target_adapter is not None:
+        labels += ["IJEPA target", "via target"]
+    if reference_adapter is not None:
+        labels.append("reference")
+    reference_labels = labels[3:].copy()
     labels += [f"{prefix} {index + 1}" for index in range(args.samples_per_image)]
     if adapter is not None:
         labels.append("in context")
     labels.append(f"wrong {prefix}")
-    rows, samples, controls, oracles = [], [], [], []
+    rows, samples, controls, oracles, references, composites = [], [], [], [], [], []
     started = time.monotonic()
     for row_index, index in enumerate(indices):
         noise = th.randn(args.samples_per_image, 3, 128, 128,
@@ -258,25 +310,35 @@ def sample(args):
         conditioning = features[index:index + 1].repeat(args.samples_per_image, 1)
         conditioning = th.cat([conditioning, features[wrong_index:wrong_index + 1]])
         noises = th.cat([noise, noise[:1]])
+        reference_conditions = []
         if adapter is not None:
-            conditioning = th.cat([dino["features"][index:index + 1].to(device), conditioning])
-            noises = th.cat([noise[:1], noises])
+            reference_conditions.append(dino["features"][index:index + 1].to(device))
+        if target_adapter is not None:
+            reference_conditions += [target_oracle[index:index + 1], via_target[index:index + 1]]
+        if reference_adapter is not None:
+            reference_conditions.append(reference[index:index + 1])
+        if reference_conditions:
+            conditioning = th.cat([*reference_conditions, conditioning])
+            noises = th.cat([noise[:1].repeat(len(reference_conditions), 1, 1, 1), noises])
         decoded = diffusion.ddim_sample_loop(model, noises.shape, noise=noises,
                                             model_kwargs={"feat": conditioning})
         if not th.isfinite(decoded).all():
             raise FloatingPointError("Pretrained RCDM produced non-finite samples.")
         decoded = ((decoded.cpu() + 1) * 127.5).clamp(0, 255).to(th.uint8)
-        if adapter is not None:
-            oracles.append(decoded[0])
-            decoded = decoded[1:]
-        samples.append(decoded[:-1])
-        controls.append(decoded[-1])
         row = comparison_row(cache, index, 128)
         if adapter is not None:
-            row.append(to_image(oracles[-1]))
+            oracles.append(decoded[0])
+        if reference_conditions:
+            references.append(decoded[:len(reference_conditions)])
+            row += [to_image(image) for image in references[-1]]
+            decoded = decoded[len(reference_conditions):]
+        samples.append(decoded[:-1])
+        controls.append(decoded[-1])
         row += [to_image(image) for image in decoded[:-1]]
         if adapter is not None:
-            row.append(prediction_in_context(cache, index, decoded[0]))
+            composite = prediction_in_context(cache, index, decoded[0])
+            composites.append(th.from_numpy(np.array(composite)).permute(2, 0, 1))
+            row.append(composite)
         rows.append(row + [to_image(decoded[-1])])
         print(f"Decoded {row_index + 1}/{count}: {cache['paths'][index]}, "
               f"elapsed {time.monotonic() - started:.1f}s", flush=True)
@@ -284,8 +346,13 @@ def sample(args):
     save_comparison_grid(rows, labels, output)
     save_cache(dict(samples=th.stack(samples), wrong_condition=th.stack(controls),
                     oracle=th.stack(oracles) if oracles else None,
+                    reference_samples=th.stack(references) if references else None,
+                    reference_labels=reference_labels,
+                    composites=th.stack(composites) if composites else None,
                     paths=[cache["paths"][index] for index in indices],
-                    boxes=cache["boxes"][indices], seed=args.seed,
+                    boxes=cache["boxes"][indices], example_indices=th.tensor(indices), seed=args.seed,
+                    sampling_steps=args.sampling_steps, adapter=args.adapter,
+                    target_adapter=args.target_adapter, reference_adapter=args.reference_adapter,
                     conditioning="dino_oracle" if adapter is None else "ijepa_predictor_adapter"),
                output.with_suffix(".pt"))
     print(f"Saved {output}", flush=True)
@@ -311,6 +378,10 @@ def create_argparser():
     train_parser.add_argument("--steps", default=2000, type=int)
     train_parser.add_argument("--batch-size", default=128, type=int)
     train_parser.add_argument("--hidden-dim", default=512, type=int)
+    train_parser.add_argument("--dropout", default=0.1, type=float)
+    train_parser.add_argument("--kind", choices=("mlp", "ridge"), default="mlp")
+    train_parser.add_argument("--ridge-alpha", default=1.0, type=float)
+    train_parser.add_argument("--feature-source", choices=("predictor", "target"), default="predictor")
     train_parser.add_argument("--lr", default=1e-3, type=float)
     train_parser.add_argument("--weight-decay", default=0.01, type=float)
     train_parser.add_argument("--log-interval", default=100, type=int)
@@ -320,6 +391,8 @@ def create_argparser():
     sample_parser.add_argument("--dino-cache", default="artifacts/dino_crop_features/val.pt")
     sample_parser.add_argument("--rcdm-checkpoint", default="artifacts/checkpoints/rcdm_ema_dino_trunk.pt")
     sample_parser.add_argument("--adapter", default="")
+    sample_parser.add_argument("--target-adapter", default="")
+    sample_parser.add_argument("--reference-adapter", default="")
     sample_parser.add_argument("--oracle-only", action="store_true")
     sample_parser.add_argument("--num-images", default=4, type=int)
     sample_parser.add_argument("--samples-per-image", default=2, type=int)

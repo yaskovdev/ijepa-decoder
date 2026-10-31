@@ -89,6 +89,7 @@ class PredictorDecoderTests(unittest.TestCase):
             expected = originals[1].clone()
             expected[:, 1:5, 2:6] = 37
             th.testing.assert_close(composite, expected, rtol=0, atol=0)
+            th.testing.assert_close(loaded["originals"], originals, rtol=0, atol=0)
             self.assertEqual(distinct_examples(loaded, 4), [0, 2])
             self.assertEqual(different_image_index(loaded, 0), 2)
             self.assertEqual(different_image_index(loaded, 2, -1), 1)
@@ -183,10 +184,59 @@ class PredictorDecoderTests(unittest.TestCase):
             model = ijepa_adapter.load_adapter(checkpoint, predictor["val"], dino_spec, "cpu")
             th.testing.assert_close(model.input_mean, predictor["train"]["features"].mean(0))
             self.assertTrue(th.isfinite(model(predictor["val"]["features"])).all().item())
+            legacy = th.load(checkpoint, weights_only=True)
+            for key in ("feature_source", "dropout", "kind"):
+                legacy.pop(key)
+            th.save(legacy, root / "legacy.pt")
+            restored = ijepa_adapter.load_adapter(root / "legacy.pt", predictor["val"], dino_spec, "cpu")
+            th.testing.assert_close(model(predictor["val"]["features"]), restored(predictor["val"]["features"]))
             with self.assertRaisesRegex(ValueError, "does not match"):
                 ijepa_adapter.load_adapter(
                     checkpoint, dict(predictor["val"], ijepa_checkpoint="different.pt"), dino_spec, "cpu"
                 )
+
+    def test_target_ridge_uses_teacher_features_and_wrong_originals(self):
+        th.manual_seed(42)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "predictor").mkdir()
+            (root / "dino").mkdir()
+            predictor, targets = {}, {}
+            dino_spec = dict(model="dino_resnet50_trunk", input_size=224,
+                             normalization="rgb_minus_one_one", checkpoint="dino.pt")
+            mapping = th.tensor([[1., 0., 0., 1.], [0., 1., 0., 1.], [0., 0., 1., 1.]])
+            for split, images in (("train", 16), ("val", 4)):
+                count = images * 2
+                teacher = th.rand(images, 3).repeat_interleave(2, 0)
+                cache = dict(features=th.rand(images, 3).repeat_interleave(2, 0),
+                             target_features=teacher, target_normalization="layer_norm_patch_tokens",
+                             targets=th.zeros(count, 3, 8, 8, dtype=th.uint8),
+                             paths=[f"{split}/{index // 2}.jpg" for index in range(count)],
+                             boxes=th.tensor([[0, 0, 4, 4]] * count),
+                             conditioning="ijepa_predictor", input_size=224, patch_size=14,
+                             block_size=7, ijepa_epoch=299, ijepa_checkpoint="official.pt")
+                predictor[split] = cache
+                targets[split] = 1 + teacher @ mapping
+                th.save(cache, root / "predictor" / f"{split}.pt")
+                th.save(dict(features=targets[split], paths=cache["paths"], boxes=cache["boxes"],
+                             feature_spec=feature_spec(cache), dino_spec=dino_spec),
+                        root / "dino" / f"{split}.pt")
+            args = ijepa_adapter.create_argparser().parse_args([
+                "train", "--device", "cpu", "--kind", "ridge", "--ridge-alpha", "0.001",
+                "--feature-source", "target", "--batch-size", "16",
+                "--cache-dir", str(root / "predictor"), "--dino-cache-dir", str(root / "dino"),
+                "--out-dir", str(root / "adapter"),
+            ])
+            ijepa_adapter.train(args)
+            model = ijepa_adapter.load_adapter(root / "adapter" / "best.pt", predictor["val"], dino_spec, "cpu")
+            actual = model(predictor["val"]["target_features"])
+            metrics = json.loads((root / "adapter" / "metrics.json").read_text())[-1]["validation"]
+            self.assertLess(metrics["mse"], 0.01)
+            wrong = actual[th.tensor([7, 7, 1, 1, 3, 3, 5, 5])]
+            expected_wrong_mse = (((wrong - targets["val"]) / model.output_scale) ** 2).mean().item()
+            self.assertAlmostEqual(metrics["wrong_mse"], expected_wrong_mse)
+            self.assertGreater(ijepa_adapter.adapter_metrics(model, predictor["val"]["features"],
+                                                           targets["val"])["mse"], 0.25)
 
     def test_sampling_rejects_features_from_a_different_ijepa_checkpoint(self):
         with tempfile.TemporaryDirectory() as folder:

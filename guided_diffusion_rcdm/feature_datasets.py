@@ -36,6 +36,11 @@ def load_feature_cache(path):
                 or not target.is_floating_point() or not th.isfinite(target).all()
                 or cache.get("target_normalization") != "layer_norm_patch_tokens"):
             raise ValueError("Target-encoder features must be paired, finite, and normalized like I-JEPA training.")
+    if "image_hashes" in cache:
+        hashes, originals = cache["image_hashes"], cache.get("originals")
+        if (not isinstance(hashes, list) or not isinstance(originals, th.Tensor)
+                or len(hashes) != len(originals) or any(not isinstance(value, str) for value in hashes)):
+            raise ValueError("Image hashes must identify every cached original image.")
     return cache
 
 

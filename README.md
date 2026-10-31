@@ -97,10 +97,17 @@ than step 2000. Its validation normalized MSE was 0.795 versus 0.961 for constan
 mean features; cosine similarity was 0.810 versus 0.641 with shuffled pairing.
 
 The grid columns are original, masked context, true target, **DINO oracle**,
-predictor samples, and wrong-predictor control. The oracle uses the true hidden
+predictor samples, **in context**, and wrong-predictor control. The oracle uses the true hidden
 RGB only as a decoder-quality reference. Predictor columns receive only the
 adapted predictor vector. DDIM uses identical initial noise for oracle,
 predictor sample 1, and the wrong-predictor control.
+
+The **in context** column pastes predictor sample 1 into its exact hidden
+rectangle at the original image resolution. All visible pixels remain unchanged;
+the hidden rectangle is fully replaced, without blending with its true pixels.
+This is a visualization, not a spatially conditioned inpainting model, so seams
+and inconsistent object alignment are expected. Oracle-only grids do not label
+ground-truth-conditioned generations as predictions.
 
 The initial predictor grid contains recognizable vehicle, golf-ball and dog
 hypotheses, with a less faithful audio-equipment example. This is a small
@@ -108,6 +115,43 @@ Imagenette proof of concept, not Meta's decoder or a full ImageNet evaluation.
 Validation is withheld from adapter training, not necessarily from the
 pretrained backbones or image prior. The released
 [RCDM weights are also noncommercial](https://dl.fbaipublicfiles.com/rcdm/LICENSE).
+
+### More Data, Multiple Masks, and a Target-Encoder Control
+
+Use Imagenette 320 for the next bounded Mac experiment. The preparation command
+below uses all 9,469 training photographs and 256 validation photographs, with
+three distinct hidden-block positions per photograph: 28,407 and 768 examples.
+Split photographs before adding masks. Original images are stored only once
+and accessed through `image_indices`; DINO pairing also checks this mapping and
+the hashes of the preprocessed original pixels.
+
+```shell
+.venv/bin/python -m scripts.ijepa_decoder prepare --device mps --data-dir artifacts/data/imagenette2-320 --out-dir artifacts/ijepa_features_320_m3 --train-limit 10000 --val-limit 256 --masks-per-image 3 --with-target-encoder
+.venv/bin/python -m scripts.ijepa_adapter prepare --device mps --cache-dir artifacts/ijepa_features_320_m3 --out-dir artifacts/dino_crop_features_320_m3
+
+.venv/bin/python -m scripts.ijepa_adapter train --device mps --cache-dir artifacts/ijepa_features_320_m3 --dino-cache-dir artifacts/dino_crop_features_320_m3 --kind ridge --ridge-alpha 1 --out-dir artifacts/ijepa_adapter_320_ridge1
+.venv/bin/python -m scripts.ijepa_adapter train --device mps --cache-dir artifacts/ijepa_features_320_m3 --dino-cache-dir artifacts/dino_crop_features_320_m3 --hidden-dim 128 --dropout 0.25 --weight-decay 0.1 --lr 0.0003 --log-interval 25 --out-dir artifacts/ijepa_adapter_320_mlp128
+.venv/bin/python -m scripts.ijepa_adapter train --device mps --cache-dir artifacts/ijepa_features_320_m3 --dino-cache-dir artifacts/dino_crop_features_320_m3 --feature-source target --kind ridge --ridge-alpha 1 --out-dir artifacts/ijepa_target_adapter_320_ridge1
+
+.venv/bin/python -m scripts.ijepa_adapter sample --device mps --cache artifacts/ijepa_features_320_m3/val.pt --dino-cache artifacts/dino_crop_features_320_m3/val.pt --adapter artifacts/ijepa_adapter_320_ridge1/best.pt --target-adapter artifacts/ijepa_target_adapter_320_ridge1/best.pt --reference-adapter artifacts/ijepa_adapter/best.pt --output artifacts/ijepa_adapter_320_ridge1/comparison.png
+```
+
+Ridge fits a regularized linear adapter using a float64 solve on CPU; inference
+and MLP training still use MPS float32. Compare ridge strengths such as 0.1, 1
+and 10, and smaller MLPs, selecting `best.pt` by held-out feature error rather
+than training duration. Sampling chooses distinct photographs by default, and
+wrong-conditioning controls use another photograph, not another mask of the
+same one.
+
+The optional **IJEPA target** column uses the actual target encoder, which sees
+hidden pixels, through a target-trained adapter. **Via target** applies that
+same adapter to predictor outputs instead. These separate mapping limitations
+from information missing in the prediction; neither is an input to the primary
+predictor adapter. Target tokens are layer-normalized individually before
+masking and pooling, as in official I-JEPA training. **Reference** uses the
+previous adapter on the same examples and boxes. All reference columns and
+predictor sample 1 share the same DDIM noise. Use `--sampling-steps 250` for a
+separate sampling-budget comparison without changing the pretrained resolution.
 
 ## Sample Using PyCharm on macOS with Remote Linux Interpreter
 
