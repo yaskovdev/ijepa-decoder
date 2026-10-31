@@ -200,7 +200,9 @@ conda activate rcdm
 # Or, actually, that's probably not the real CUDA version, see https://stackoverflow.com/a/55717476/1862286.
 pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 
-cd /tmp/pycharm_project_931 # This is what you've specified in the "Sync folders" while creating your SSH interpreter in PyCharm
+mkdir ~/rcdm
+cd ~/rcdm
+# Create a new Conda SSH interpreter in PyCharm and specify the newly created as the target of "Sync folders" while creating your SSH interpreter in PyCharm
 pip install -e .
 
 # Note: Make sure that the `/home/yaskovdev/rcdm_images` contains at least one image, otherwise sampling will get stuck.
@@ -211,22 +213,25 @@ You can then run `scp yaskovdev@192.168.1.186:/home/yaskovdev/rcdm/samples.jpeg 
 
 # Train Using PyCharm on macOS with Remote Linux Interpreter
 
-Extract the images (TODO: specify the URL to the dataset) to a `/home/yaskovdev/images` folder.
+Download the dataset: https://www.kaggle.com/datasets/thbdh5765/ilsvrc2012/data.
+
+Extract the archive to a `/home/yaskovdev/images` folder.
 
 ```shell
 # Run the below commands on the Linux machine.
 cd ~/rcdm
-conda activate rcdm2
+conda activate rcdm
 
-export MODEL_FLAGS_64="--attention_resolutions 32,16,8 --class_cond False --diffusion_steps 1000 --image_size 64 --learn_sigma True --noise_schedule linear --num_channels 256 --num_heads 4 --num_res_blocks 2 --resblock_updown True --use_fp16 False --use_scale_shift_norm True"
-export TRAIN_FLAGS="--lr 3e-4 --batch_size 16 --save_interval 5000 --weight_decay 0.05"
+export MODEL_FLAGS_128="--attention_resolutions 32,16,8 --class_cond False --diffusion_steps 1000 --image_size 128 --learn_sigma True --noise_schedule linear --num_channels 256 --num_heads 4 --num_res_blocks 2 --resblock_updown True --use_fp16 False --use_scale_shift_norm True"
+export TRAIN_FLAGS="--lr 1e-4 --batch_size 8 --save_interval 5000"
 
-python scripts/image_train.py $MODEL_FLAGS_64 $TRAIN_FLAGS --feat_cond --data_dir /home/yaskovdev/images --type_model dino --out_dir /home/yaskovdev/save_dir_64
+# Train on a PC with 2 GPUs:
+torchrun --nproc_per_node=2 scripts/image_train.py $MODEL_FLAGS_128 $TRAIN_FLAGS --feat_cond --data_dir /home/yaskovdev/images --type_model dino --out_dir /home/yaskovdev/save_dir_128
 
-# If you interrupted the training earlier, you can resume by passing resume_checkpoint
+# To resume an interrupted run, add --resume_checkpoint /home/yaskovdev/save_dir_128/model050000.pt to the training command, using your actual checkpoint path.
 
 # Sample from the trained model:
-python scripts/image_sample.py $MODEL_FLAGS_64 --batch_size 8 --num_images 1 --timestep_respacing 100 --data_dir "/home/yaskovdev/rcdm_images" --model_path /home/yaskovdev/save_dir_64/model010000.pt --type_model dino
+python scripts/image_sample.py $MODEL_FLAGS_128 --batch_size 8 --num_images 1 --timestep_respacing 100 --data_dir "/home/yaskovdev/rcdm_images" --model_path /home/yaskovdev/save_dir_128/model090000.pt --type_model dino
 ```
 
 ## Sample on Windows
