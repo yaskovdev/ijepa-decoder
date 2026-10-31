@@ -8,7 +8,7 @@ import torch as th
 import torch.nn.functional as F
 
 from guided_diffusion_rcdm import dist_util
-from guided_diffusion_rcdm.feature_datasets import load_feature_cache
+from guided_diffusion_rcdm.feature_datasets import different_image_index, distinct_examples, load_feature_cache
 from guided_diffusion_rcdm.get_ssl_models import load_dino_trunk
 from guided_diffusion_rcdm.ijepa import PredictorAdapter
 from guided_diffusion_rcdm.script_util import create_model_and_diffusion, model_and_diffusion_defaults
@@ -16,6 +16,7 @@ from scripts.ijepa_decoder import (
     comparison_row,
     feature_spec,
     hidden_crop,
+    prediction_in_context,
     save_cache,
     save_comparison_grid,
     to_image,
@@ -64,14 +65,19 @@ def prepare(args):
         features = th.cat(features)
         if features.shape != (len(cache["features"]), 2048) or not th.isfinite(features).all():
             raise ValueError("Invalid DINO trunk features.")
-        save_cache(dict(
+        payload = dict(
             features=features,
             paths=cache["paths"],
             boxes=cache["boxes"],
             feature_spec=feature_spec(cache),
             dino_spec=dict(model="dino_resnet50_trunk", input_size=224,
                            normalization="rgb_minus_one_one", checkpoint=Path(args.dino_checkpoint).name),
-        ), out_dir / f"{split}.pt")
+        )
+        if "image_indices" in cache:
+            payload["image_indices"] = cache["image_indices"]
+        if "image_hashes" in cache:
+            payload["image_hashes"] = cache["image_hashes"]
+        save_cache(payload, out_dir / f"{split}.pt")
     print(f"Saved aligned DINO feature caches to {out_dir}", flush=True)
 
 
@@ -79,7 +85,11 @@ def load_dino_cache(path, predictor_cache):
     cache = th.load(path, map_location="cpu", weights_only=True)
     if (cache["feature_spec"] != feature_spec(predictor_cache)
             or cache["paths"] != predictor_cache["paths"]
-            or not th.equal(cache["boxes"], predictor_cache["boxes"])):
+            or not th.equal(cache["boxes"], predictor_cache["boxes"])
+            or ("image_indices" in cache) != ("image_indices" in predictor_cache)
+            or ("image_indices" in cache and not th.equal(cache["image_indices"],
+                                                         predictor_cache["image_indices"]))
+            or cache.get("image_hashes") != predictor_cache.get("image_hashes")):
         raise ValueError("DINO targets do not match the predictor images, checkpoint, or hidden boxes.")
     features = cache["features"]
     if (features.ndim != 2 or features.shape[0] != len(predictor_cache["features"])
@@ -229,18 +239,22 @@ def sample(args):
         raise ValueError("The released prior requires 2048-dimensional DINO conditioning.")
     model, diffusion = load_prior(args.rcdm_checkpoint, device, args.sampling_steps)
     features = dino["features"].to(device) if adapter is None else adapter(cache["features"].to(device))
-    count = min(args.num_images, len(features))
+    indices = distinct_examples(cache, args.num_images)
+    count = len(indices)
     prefix = "oracle" if adapter is None else "predictor"
     labels = ["original", "context", "target"]
     if adapter is not None:
         labels.append("DINO oracle")
-    labels += [f"{prefix} {index + 1}" for index in range(args.samples_per_image)] + [f"wrong {prefix}"]
+    labels += [f"{prefix} {index + 1}" for index in range(args.samples_per_image)]
+    if adapter is not None:
+        labels.append("in context")
+    labels.append(f"wrong {prefix}")
     rows, samples, controls, oracles = [], [], [], []
     started = time.monotonic()
-    for index in range(count):
+    for row_index, index in enumerate(indices):
         noise = th.randn(args.samples_per_image, 3, 128, 128,
-                         generator=th.Generator().manual_seed(args.seed + index)).to(device)
-        wrong_index = (index + 1) % len(features)
+                         generator=th.Generator().manual_seed(args.seed + row_index)).to(device)
+        wrong_index = different_image_index(cache, index)
         conditioning = features[index:index + 1].repeat(args.samples_per_image, 1)
         conditioning = th.cat([conditioning, features[wrong_index:wrong_index + 1]])
         noises = th.cat([noise, noise[:1]])
@@ -260,14 +274,18 @@ def sample(args):
         row = comparison_row(cache, index, 128)
         if adapter is not None:
             row.append(to_image(oracles[-1]))
-        rows.append(row + [to_image(image) for image in decoded])
-        print(f"Decoded {index + 1}/{count}: {cache['paths'][index]}, "
+        row += [to_image(image) for image in decoded[:-1]]
+        if adapter is not None:
+            row.append(prediction_in_context(cache, index, decoded[0]))
+        rows.append(row + [to_image(decoded[-1])])
+        print(f"Decoded {row_index + 1}/{count}: {cache['paths'][index]}, "
               f"elapsed {time.monotonic() - started:.1f}s", flush=True)
     output = Path(args.output)
     save_comparison_grid(rows, labels, output)
     save_cache(dict(samples=th.stack(samples), wrong_condition=th.stack(controls),
                     oracle=th.stack(oracles) if oracles else None,
-                    paths=cache["paths"][:count], seed=args.seed,
+                    paths=[cache["paths"][index] for index in indices],
+                    boxes=cache["boxes"][indices], seed=args.seed,
                     conditioning="dino_oracle" if adapter is None else "ijepa_predictor_adapter"),
                output.with_suffix(".pt"))
     print(f"Saved {output}", flush=True)

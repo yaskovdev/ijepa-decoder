@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import random
 import time
@@ -9,8 +10,12 @@ import torch as th
 from PIL import Image, ImageDraw
 
 from guided_diffusion_rcdm import dist_util
-from guided_diffusion_rcdm.feature_datasets import load_feature_cache
-from guided_diffusion_rcdm.ijepa import load_ijepa_models, make_block_masks, predict_features
+from guided_diffusion_rcdm.feature_datasets import (
+    different_image_index, distinct_examples, load_feature_cache, original_for_example,
+)
+from guided_diffusion_rcdm.ijepa import (
+    load_ijepa_models, load_ijepa_with_target, make_block_masks, predict_features, target_features,
+)
 from guided_diffusion_rcdm.image_datasets import _list_image_files_recursively, center_crop_arr
 from guided_diffusion_rcdm.script_util import (
     args_to_dict,
@@ -41,6 +46,9 @@ def prepare(args):
     if args.image_size not in (64, 128):
         raise ValueError("The pilot supports 64 or 128 pixel targets.")
     make_block_masks(0, 0, args.block_size)
+    positions_per_axis = 17 - args.block_size
+    if not 0 < args.masks_per_image <= positions_per_axis ** 2:
+        raise ValueError("masks_per_image must fit the available distinct block positions.")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     for split in ("train", "val"):
@@ -52,11 +60,18 @@ def prepare(args):
     th.manual_seed(args.seed)
     th.set_num_threads(args.cpu_threads)
     print(f"Loading frozen official ViT-H/14 encoder and predictor on {device}.", flush=True)
-    encoder, predictor, epoch = load_ijepa_models(args.ijepa_repo, args.checkpoint, device)
+    target_encoder = None
+    if args.with_target_encoder:
+        encoder, predictor, target_encoder, epoch = load_ijepa_with_target(
+            args.ijepa_repo, args.checkpoint, device
+        )
+    else:
+        encoder, predictor, epoch = load_ijepa_models(args.ijepa_repo, args.checkpoint, device)
     print(f"I-JEPA checkpoint epoch: {epoch}", flush=True)
     mean = th.tensor([0.485, 0.456, 0.406]).reshape(1, 3, 1, 1)
     std = th.tensor([0.229, 0.224, 0.225]).reshape(1, 3, 1, 1)
     started = time.monotonic()
+    train_hashes = set()
     for split, limit in (("train", args.train_limit), ("val", args.val_limit)):
         rng = random.Random(args.seed + (split == "val"))
         files = _list_image_files_recursively(str(Path(args.data_dir) / split))
@@ -64,48 +79,79 @@ def prepare(args):
             raise ValueError(f"No images found in {split}.")
         rng.shuffle(files)
         files = files[:limit]
-        originals, targets, boxes, contexts, hidden = [], [], [], [], []
-        for filename in files:
+        originals, targets, boxes, contexts, hidden, image_indices, image_hashes = [], [], [], [], [], [], []
+        image_paths = [str(Path(filename).relative_to(args.data_dir)) for filename in files]
+        for image_index, filename in enumerate(files):
             with Image.open(filename) as image:
                 arr = center_crop_arr(image.convert("RGB"), 224).copy()
             original = th.from_numpy(arr).permute(2, 0, 1).contiguous()
-            top, left = rng.randrange(17 - args.block_size), rng.randrange(17 - args.block_size)
-            context, target = make_block_masks(top, left, args.block_size)
-            box = (left * 14, top * 14, (left + args.block_size) * 14, (top + args.block_size) * 14)
-            crop = Image.fromarray(arr).crop(box).resize((args.image_size, args.image_size), Image.Resampling.BICUBIC)
+            digest = hashlib.sha256(arr.tobytes()).hexdigest()
+            if split == "val" and digest in train_hashes:
+                raise ValueError("The same preprocessed original image appears in train and validation.")
+            if split == "train":
+                train_hashes.add(digest)
+            image_hashes.append(digest)
             originals.append(original)
-            targets.append(th.from_numpy(np.array(crop)).permute(2, 0, 1).contiguous())
-            boxes.append(box)
-            contexts.append(context)
-            hidden.append(target)
+            if args.masks_per_image == 1:
+                positions = [(rng.randrange(positions_per_axis), rng.randrange(positions_per_axis))]
+            else:
+                positions = [divmod(index, positions_per_axis)
+                             for index in rng.sample(range(positions_per_axis ** 2), args.masks_per_image)]
+            for top, left in positions:
+                context, target = make_block_masks(top, left, args.block_size)
+                box = (left * 14, top * 14, (left + args.block_size) * 14, (top + args.block_size) * 14)
+                crop = Image.fromarray(arr).crop(box).resize(
+                    (args.image_size, args.image_size), Image.Resampling.BICUBIC
+                )
+                targets.append(th.from_numpy(np.array(crop)).permute(2, 0, 1).contiguous())
+                boxes.append(box)
+                contexts.append(context)
+                hidden.append(target)
+                image_indices.append(image_index)
         originals = th.stack(originals)
         context_indices, target_indices = th.stack(contexts), th.stack(hidden)
-        features = []
+        features, teacher_features = [], []
         for start in range(0, len(files), args.batch_size):
-            batch = (originals[start:start + args.batch_size].float() / 255 - mean) / std
-            context = context_indices[start:start + args.batch_size].to(device)
-            target = target_indices[start:start + args.batch_size].to(device)
-            feat = predict_features(encoder, predictor, batch.to(device), context, target).cpu()
+            end = min(start + args.batch_size, len(files))
+            batch = ((originals[start:end].float() / 255 - mean) / std).to(device)
+            local_indices = th.arange(end - start, device=device).repeat_interleave(args.masks_per_image)
+            repeated = batch[local_indices]
+            context = context_indices[start * args.masks_per_image:end * args.masks_per_image].to(device)
+            target = target_indices[start * args.masks_per_image:end * args.masks_per_image].to(device)
+            feat = predict_features(encoder, predictor, repeated, context, target).cpu()
+            if target_encoder is not None:
+                teacher_features.append(target_features(target_encoder, batch, target, local_indices).cpu())
             if split == "train" and start == 0:
-                changed = batch.clone()
+                changed = repeated.clone()
                 x0, y0, x1, y1 = boxes[0]
                 changed[:1, :, y0:y1, x0:x1] = 0
                 counterfactual = predict_features(
-                    encoder, predictor, changed.to(device), context, target
+                    encoder, predictor, changed, context, target
                 ).cpu()
                 th.testing.assert_close(feat, counterfactual, rtol=0, atol=0)
                 print("Verified: changing hidden pixels does not change predictor conditioning.", flush=True)
+                if target_encoder is not None:
+                    changed_original = batch.clone()
+                    changed_original[:1, :, y0:y1, x0:x1] = 0
+                    changed_target = target_features(target_encoder, changed_original, target, local_indices).cpu()
+                    if th.equal(teacher_features[-1][0], changed_target[0]):
+                        raise AssertionError("Target encoder did not respond to changed hidden pixels.")
+                    print("Verified: the target-encoder control responds to hidden pixels.", flush=True)
             features.append(feat)
             print(f"{split}: {min(start + args.batch_size, len(files))}/{len(files)}, "
                   f"elapsed {time.monotonic() - started:.1f}s", flush=True)
         cache = dict(
-            version=1,
+            version=2,
             conditioning="ijepa_predictor",
             targets=th.stack(targets),
             features=th.cat(features),
             originals=originals,
             boxes=th.tensor(boxes),
-            paths=[str(Path(filename).relative_to(args.data_dir)) for filename in files],
+            image_indices=th.tensor(image_indices),
+            image_paths=image_paths,
+            image_hashes=image_hashes,
+            paths=[image_paths[index] for index in image_indices],
+            masks_per_image=args.masks_per_image,
             input_size=224,
             patch_size=14,
             block_size=args.block_size,
@@ -113,6 +159,8 @@ def prepare(args):
             ijepa_checkpoint=str(Path(args.checkpoint).resolve()),
             seed=args.seed,
         )
+        if teacher_features:
+            cache.update(target_features=th.cat(teacher_features), target_normalization="layer_norm_patch_tokens")
         save_cache(cache, out_dir / f"{split}.pt")
         print(f"Saved {out_dir / f'{split}.pt'}", flush=True)
 
@@ -175,7 +223,7 @@ def to_image(tensor):
 
 
 def hidden_crop(cache, index, size):
-    original = to_image(cache["originals"][index])
+    original = to_image(original_for_example(cache, index))
     x0, y0, x1, y1 = cache["boxes"][index].tolist()
     if not (0 <= x0 < x1 <= original.width and 0 <= y0 < y1 <= original.height):
         raise ValueError("Hidden crop lies outside the cached original image.")
@@ -183,13 +231,23 @@ def hidden_crop(cache, index, size):
 
 
 def comparison_row(cache, index, size):
-    original = to_image(cache["originals"][index])
+    original = to_image(original_for_example(cache, index))
     x0, y0, x1, y1 = cache["boxes"][index].tolist()
     target = hidden_crop(cache, index, size)
     context = original.copy()
     ImageDraw.Draw(context).rectangle((x0, y0, x1 - 1, y1 - 1), fill=(127, 127, 127))
     ImageDraw.Draw(original).rectangle((x0, y0, x1 - 1, y1 - 1), outline=(0, 200, 0), width=2)
     return [original, context, target]
+
+
+def prediction_in_context(cache, index, prediction):
+    image = to_image(original_for_example(cache, index)).copy()
+    x0, y0, x1, y1 = cache["boxes"][index].tolist()
+    if not (0 <= x0 < x1 <= image.width and 0 <= y0 < y1 <= image.height):
+        raise ValueError("Hidden crop lies outside the cached original image.")
+    patch = to_image(prediction).resize((x1 - x0, y1 - y0), Image.Resampling.BICUBIC)
+    image.paste(patch, (x0, y0))
+    return image
 
 
 def save_comparison_grid(rows, labels, output, cell=128):
@@ -233,20 +291,21 @@ def sample(args):
     model.load_state_dict(th.load(args.checkpoint, map_location="cpu", weights_only=True), strict=True)
     model.to(device).eval().requires_grad_(False)
     size = config["image_size"]
-    count = min(args.num_images, len(cache["features"]))
+    indices = distinct_examples(cache, args.num_images)
+    count = len(indices)
     labels = ["original", "context", "target"] + [
         f"sample {index + 1}" for index in range(args.samples_per_image)
-    ] + ["wrong condition"]
+    ] + ["in context", "wrong condition"]
     cell = max(size, 128)
     samples, controls, rows = [], [], []
-    for index in range(count):
+    for row_index, index in enumerate(indices):
         feature = cache["features"][index:index + 1].repeat(args.samples_per_image, 1).to(device)
         noise = th.randn(
             args.samples_per_image, 3, size, size,
-            generator=th.Generator().manual_seed(args.seed + index),
+            generator=th.Generator().manual_seed(args.seed + row_index),
         ).to(device)
         decoded = diffusion.ddim_sample_loop(model, noise.shape, noise=noise, model_kwargs={"feat": feature})
-        wrong_index = (index + 1) % len(cache["features"])
+        wrong_index = different_image_index(cache, index)
         wrong = diffusion.ddim_sample_loop(
             model, noise[:1].shape, noise=noise[:1].clone(),
             model_kwargs={"feat": cache["features"][wrong_index:wrong_index + 1].to(device)},
@@ -259,13 +318,15 @@ def sample(args):
         controls.append(wrong)
         row = comparison_row(cache, index, size)
         row += [to_image(image) for image in decoded]
+        row += [prediction_in_context(cache, index, decoded[0])]
         row += [to_image(wrong[0])]
         rows.append(row)
-        print(f"Decoded {index + 1}/{count}: {cache['paths'][index]}", flush=True)
+        print(f"Decoded {row_index + 1}/{count}: {cache['paths'][index]}", flush=True)
     output = Path(args.output)
     save_comparison_grid(rows, labels, output, cell)
     save_cache(dict(samples=th.stack(samples), wrong_condition=th.stack(controls),
-                    paths=cache["paths"][:count], seed=args.seed), output.with_suffix(".pt"))
+                    paths=[cache["paths"][index] for index in indices],
+                    boxes=cache["boxes"][indices], seed=args.seed), output.with_suffix(".pt"))
     print(f"Saved {output}", flush=True)
 
 
@@ -284,6 +345,8 @@ def create_argparser():
     prepare_parser.add_argument("--image-size", default=64, type=int)
     prepare_parser.add_argument("--block-size", default=7, type=int)
     prepare_parser.add_argument("--batch-size", default=4, type=int)
+    prepare_parser.add_argument("--masks-per-image", default=1, type=int)
+    prepare_parser.add_argument("--with-target-encoder", action="store_true")
     prepare_parser.add_argument("--train-limit", default=1000, type=int)
     prepare_parser.add_argument("--val-limit", default=64, type=int)
     prepare_parser.set_defaults(func=prepare)

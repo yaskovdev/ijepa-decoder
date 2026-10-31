@@ -9,13 +9,15 @@ import torch as th
 from torch import nn
 
 from guided_diffusion_rcdm import dist_util, logger
-from guided_diffusion_rcdm.feature_datasets import load_feature_cache, load_feature_data
+from guided_diffusion_rcdm.feature_datasets import (
+    different_image_index, distinct_examples, load_feature_cache, load_feature_data,
+)
 from guided_diffusion_rcdm.gaussian_diffusion import _extract_into_tensor
-from guided_diffusion_rcdm.ijepa import make_block_masks, predict_features
+from guided_diffusion_rcdm.ijepa import PredictorAdapter, make_block_masks, predict_features, target_features
 from guided_diffusion_rcdm.script_util import create_gaussian_diffusion, create_model
 from guided_diffusion_rcdm.train_util import TrainLoop
 from scripts.ijepa_decoder import feature_spec, sample
-from scripts.ijepa_decoder import hidden_crop
+from scripts.ijepa_decoder import hidden_crop, prediction_in_context
 from scripts import ijepa_adapter
 
 
@@ -71,6 +73,52 @@ class PredictorDecoderTests(unittest.TestCase):
         cache["boxes"][0] = th.tensor([7, 7, 9, 9])
         with self.assertRaisesRegex(ValueError, "outside"):
             hidden_crop(cache, 0, 4)
+
+    def test_multi_mask_cache_and_composite_preserve_visible_pixels(self):
+        originals = th.arange(2 * 3 * 8 * 8).remainder(256).to(th.uint8).reshape(2, 3, 8, 8)
+        cache = dict(originals=originals, image_indices=th.tensor([0, 0, 1, 1]),
+                     image_paths=["a.jpg", "b.jpg"], paths=["a.jpg", "a.jpg", "b.jpg", "b.jpg"],
+                     boxes=th.tensor([[2, 1, 6, 5]] * 4), features=th.ones(4, 3),
+                     targets=th.zeros(4, 3, 4, 4, dtype=th.uint8))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cache.pt"
+            th.save(cache, path)
+            loaded = load_feature_cache(path)
+            patch = th.full((3, 6, 6), 37, dtype=th.uint8)
+            composite = th.from_numpy(np.array(prediction_in_context(loaded, 2, patch))).permute(2, 0, 1)
+            expected = originals[1].clone()
+            expected[:, 1:5, 2:6] = 37
+            th.testing.assert_close(composite, expected, rtol=0, atol=0)
+            self.assertEqual(distinct_examples(loaded, 4), [0, 2])
+            self.assertEqual(different_image_index(loaded, 0), 2)
+            self.assertEqual(different_image_index(loaded, 2, -1), 1)
+            cache["image_indices"][2] = 5
+            th.save(cache, path)
+            with self.assertRaisesRegex(ValueError, "map every example"):
+                load_feature_cache(path)
+
+    def test_target_encoder_features_normalize_tokens_before_pooling(self):
+        images = th.randn(2, 3, 8, 8)
+        indices = th.tensor([[0, 1], [2, 3], [0, 1]])
+        image_indices = th.tensor([0, 1, 0])
+        encoder = PatchEncoder()
+        actual = target_features(encoder, images, indices, image_indices)
+        tokens = th.nn.functional.layer_norm(encoder(images), (3,))
+        expected = th.stack([tokens[image, mask].mean(0) for image, mask in zip(image_indices, indices)])
+        th.testing.assert_close(actual, expected)
+        raw = encoder(images)[0, indices[0]].mean(0)
+        self.assertFalse(th.allclose(actual[0], th.nn.functional.layer_norm(raw, (3,))))
+
+    def test_ridge_adapter_uses_cpu_solve_even_with_mps_features(self):
+        th.manual_seed(2)
+        features = th.rand(32, 3)
+        targets = 1 + features @ th.rand(3, 4)
+        for device in ("cpu", "mps") if th.backends.mps.is_available() else ("cpu",):
+            model = PredictorAdapter(3, 4, hidden_dim=0)
+            model.fit_statistics(features, targets)
+            model.to(device)
+            model.fit_ridge(features.to(device), targets.to(device), 0.001)
+            th.testing.assert_close(model(features.to(device)).cpu(), targets, rtol=0.01, atol=0.01)
 
     def test_dino_cache_rejects_different_boxes_and_normalization(self):
         predictor = dict(
