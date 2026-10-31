@@ -73,23 +73,31 @@ def make_rectangle_masks(top, left, height, width, grid_size=16):
 
 @th.no_grad()
 def predict_features(encoder, predictor, images, context_indices, target_indices):
+    return predict_tokens(encoder, predictor, images, context_indices, target_indices).mean(dim=1)
+
+
+@th.no_grad()
+def predict_tokens(encoder, predictor, images, context_indices, target_indices):
     if images.shape[0] != context_indices.shape[0] or images.shape[0] != target_indices.shape[0]:
         raise ValueError("Images and masks must have the same batch size.")
     context = encoder(images, masks=[context_indices])
-    predictions = predictor(context, [context_indices], [target_indices])
-    return predictions.mean(dim=1)
+    return predictor(context, [context_indices], [target_indices])
 
 
 @th.no_grad()
 def target_features(encoder, images, target_indices, image_indices):
+    return target_tokens(encoder, images, target_indices, image_indices).mean(1)
+
+
+@th.no_grad()
+def target_tokens(encoder, images, target_indices, image_indices):
     if target_indices.ndim != 2 or image_indices.shape != (target_indices.shape[0],):
         raise ValueError("Target masks require one original-image index per example.")
     tokens = encoder(images)
     # Match I-JEPA's training target: normalize each token before masking/pooling.
     tokens = th.nn.functional.layer_norm(tokens, (tokens.shape[-1],))
     tokens = tokens[image_indices]
-    selected = th.gather(tokens, 1, target_indices[..., None].expand(-1, -1, tokens.shape[-1]))
-    return selected.mean(1)
+    return th.gather(tokens, 1, target_indices[..., None].expand(-1, -1, tokens.shape[-1]))
 
 
 class PredictorAdapter(th.nn.Module):
