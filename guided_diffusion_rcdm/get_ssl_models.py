@@ -4,6 +4,16 @@ import torch
 import torch.nn as nn
 from torchvision import models as torchvision_models
 
+
+def load_dino_trunk(checkpoint, device="cpu"):
+    model = torchvision_models.resnet50(weights=None)
+    model.fc = nn.Identity()
+    state = torch.load(checkpoint, map_location="cpu", weights_only=True, mmap=True)
+    model.load_state_dict(state, strict=True)
+    del state
+    return model.eval().requires_grad_(False).to(device)
+
+
 class Wrapper(nn.Module):
     """
     Projector that is used when training Dino. This projector is added on top of a traditional resnet.

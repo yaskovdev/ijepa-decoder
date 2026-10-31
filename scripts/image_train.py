@@ -8,6 +8,7 @@ import torch as th
 import torch.nn as nn
 from guided_diffusion_rcdm import dist_util, logger
 from guided_diffusion_rcdm.image_datasets import load_data
+from guided_diffusion_rcdm.feature_datasets import load_feature_cache, load_feature_data
 from guided_diffusion_rcdm.resample import create_named_schedule_sampler
 from guided_diffusion_rcdm.script_util import (
     model_and_diffusion_defaults,
@@ -17,17 +18,28 @@ from guided_diffusion_rcdm.script_util import (
 )
 from guided_diffusion_rcdm.train_util import TrainLoop
 from guided_diffusion_rcdm.get_ssl_models import get_model
-from torch.cuda.amp import autocast
 
 def main(args):
     # Init distributed setup
     dist_util.init_distributed_mode(args)
     logger.configure(dir=args.out_dir)
+    if args.use_fp16 and args.device.type != "cuda":
+        raise ValueError("Use --use_fp16 False for MPS/CPU training.")
 
     # Load SSL model
-    if args.feat_cond:
-        ssl_model = get_model(args.type_model, args.use_head).to(args.gpu).eval()
-        ssl_dim = ssl_model(th.zeros(1,3,224,224).to(args.gpu)).size(1)
+    if args.feature_cache:
+        cache = load_feature_cache(args.feature_cache)
+        if cache["targets"].shape[-1] != args.image_size:
+            raise ValueError("image_size does not match the feature cache.")
+        args.feat_cond = True
+        ssl_model = None
+        ssl_dim = cache["features"].shape[1]
+        print("Cached SSL DIM:", ssl_dim)
+    elif args.feat_cond:
+        ssl_model = get_model(args.type_model, args.use_head).to(args.device).eval()
+        ssl_model.requires_grad_(False)
+        with th.no_grad():
+            ssl_dim = ssl_model(th.zeros(1,3,224,224).to(args.device)).size(1)
         print("SSL DIM:", ssl_dim)
         for _,p in ssl_model.named_parameters():
             p.requires_grad_(False)
@@ -42,14 +54,15 @@ def main(args):
         **args_to_dict(args, model_and_diffusion_defaults().keys()), G_shared=args.no_shared, feat_cond=args.feat_cond, ssl_dim=ssl_dim
     )
 
-    model.to(args.gpu)
+    model.to(args.device)
     schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion)
 
     # Create the dataloader
     logger.log("creating data loader...")
-    data = load_ssl_data(
-        args,
-        ssl_model=ssl_model,
+    data = (
+        load_feature_data(cache, args.batch_size, args.seed)
+        if args.feature_cache
+        else load_ssl_data(args, ssl_model=ssl_model)
     )
 
     logger.log("training...")
@@ -69,7 +82,8 @@ def main(args):
         fp16_scale_growth=args.fp16_scale_growth,
         schedule_sampler=schedule_sampler,
         weight_decay=args.weight_decay,
-        lr_anneal_steps=args.lr_anneal_steps
+        lr_anneal_steps=args.lr_anneal_steps,
+        max_steps=args.max_steps,
     ).run_loop()
 
 def load_ssl_data(args, ssl_model=None):
@@ -83,10 +97,10 @@ def load_ssl_data(args, ssl_model=None):
         # We add the conditioning in conditional mode
         if ssl_model is not None:
             with th.no_grad():
-                with autocast(args.use_fp16):
+                with dist_util.autocast(args.use_fp16):
                     # we always use an image of size 224x224 for conditioning
                     # Here we actually give an image to the SSL model and get back the representation of the image
-                    model_kwargs["feat"] = ssl_model(batch_big.to(args.gpu)).detach()
+                    model_kwargs["feat"] = ssl_model(batch_big.to(args.device)).detach()
             yield batch, model_kwargs
         else:
             yield batch, model_kwargs
@@ -94,10 +108,14 @@ def load_ssl_data(args, ssl_model=None):
 def create_argparser():
     defaults = dict(
         data_dir="",
+        feature_cache="",
+        seed=0,
         schedule_sampler="uniform",
         lr=1e-4,
         weight_decay=0.0,
         lr_anneal_steps=0,
+        max_steps=0,
+        device="auto",
         batch_size=1,
         microbatch=-1,  # -1 disables microbatches
         ema_rate="0.9999",  # comma-separated list of EMA values

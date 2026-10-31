@@ -29,7 +29,9 @@ def exclude_bias_and_norm(p):
 
 def main(args):
     
-    args.gpu = 0
+    device = dist_util.set_device(args.device)
+    if args.use_fp16 and device.type != "cuda":
+        raise ValueError("Use --use_fp16 False for MPS/CPU sampling.")
     logger.configure(dir=args.out_dir)
 
     tr_normalize = transforms.Normalize(
@@ -54,10 +56,10 @@ def main(args):
     )
 
     # Use features conditioning
-    ssl_model = get_model(args.type_model, args.use_head).cuda().eval()
-    for p in ssl_model.parameters():
-        ssl_model.requires_grad = False
-    ssl_dim = ssl_model(th.zeros(1,3,224,224).cuda()).size(1)
+    ssl_model = get_model(args.type_model, args.use_head).to(device).eval()
+    ssl_model.requires_grad_(False)
+    with th.no_grad():
+        ssl_dim = ssl_model(th.zeros(1,3,224,224).to(device)).size(1)
 
     # ============ preparing data ... ============
     logger.log("creating model and diffusion...")
@@ -84,7 +86,7 @@ def main(args):
     while num_current_samples < args.num_images:
 
         batch_small, batch, cond = next(data)
-        batch = batch[0:1].repeat(args.batch_size, 1, 1, 1).cuda()
+        batch = batch[0:1].repeat(args.batch_size, 1, 1, 1).to(device)
         model_kwargs = {}
 
         with th.no_grad():
@@ -128,6 +130,7 @@ def create_argparser():
         local_rank=0,
         dist_url="env://",
         G_shared=False,
+        device="auto",
     )
     defaults.update(model_and_diffusion_defaults())
     parser = argparse.ArgumentParser()

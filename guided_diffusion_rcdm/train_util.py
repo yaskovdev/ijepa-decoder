@@ -38,6 +38,7 @@ class TrainLoop:
         schedule_sampler=None,
         weight_decay=0.0,
         lr_anneal_steps=0,
+        max_steps=0,
     ):
         self.model = model
         self.diffusion = diffusion
@@ -58,10 +59,13 @@ class TrainLoop:
         self.schedule_sampler = schedule_sampler or UniformSampler(diffusion)
         self.weight_decay = weight_decay
         self.lr_anneal_steps = lr_anneal_steps
+        if max_steps < 0:
+            raise ValueError("max_steps must be nonnegative.")
+        self.max_steps = max_steps
 
         self.step = 0
         self.resume_step = 0
-        self.global_batch = self.batch_size * dist.get_world_size()
+        self.global_batch = self.batch_size * dist_util.get_world_size()
 
         self.sync_cuda = th.cuda.is_available()
 
@@ -88,7 +92,7 @@ class TrainLoop:
                 for _ in range(len(self.ema_rate))
             ]
 
-        if th.cuda.is_available():
+        if dist_util.dev().type == "cuda" and dist_util.is_dist_avail_and_initialized():
             self.use_ddp = True
             self.ddp_model = DDP(
                 self.model,
@@ -99,7 +103,7 @@ class TrainLoop:
                 find_unused_parameters=True,
             )
         else:
-            if dist.get_world_size() > 1:
+            if dist_util.get_world_size() > 1:
                 logger.warn(
                     "Distributed training requires CUDA. "
                     "Gradients will not be synchronized properly!"
@@ -115,7 +119,7 @@ class TrainLoop:
 
         if resume_checkpoint:
             self.resume_step = parse_resume_step_from_filename(resume_checkpoint)
-            if dist.get_rank() == 0:
+            if dist_util.get_rank() == 0:
                 logger.log(f"loading model from checkpoint: {resume_checkpoint}...")
                 trained_model = th.load(resume_checkpoint, map_location=dist_util.dev())
                 self.model.load_state_dict(trained_model)
@@ -131,7 +135,7 @@ class TrainLoop:
             main_checkpoint, self.resume_step = find_resume_checkpoint()
         ema_checkpoint = find_ema_checkpoint(main_checkpoint, self.resume_step, rate)
         if ema_checkpoint:
-            if dist.get_rank() == 0:
+            if dist_util.get_rank() == 0:
                 logger.log(f"loading EMA from checkpoint: {ema_checkpoint}...")
                 state_dict = th.load(ema_checkpoint, map_location=dist_util.dev())
                 ema_params = self.mp_trainer.state_dict_to_master_params(state_dict)
@@ -154,21 +158,22 @@ class TrainLoop:
 
     def run_loop(self):
         while (
-            not self.lr_anneal_steps
-            or self.step + self.resume_step < self.lr_anneal_steps
+            (not self.max_steps or self.step + self.resume_step < self.max_steps)
+            and (not self.lr_anneal_steps
+                 or self.step + self.resume_step < self.lr_anneal_steps)
         ):
             batch, cond = next(self.data)
             self.run_step(batch, cond)
             if self.step % self.log_interval == 0:
                 logger.dumpkvs()
-            if self.step % self.save_interval == 0:
+            self.step += 1
+            if (self.step + self.resume_step) % self.save_interval == 0:
                 self.save()
                 # Run for a finite amount of time in integration tests.
                 if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
                     return
-            self.step += 1
         # Save the last checkpoint if it wasn't already saved.
-        if (self.step - 1) % self.save_interval != 0:
+        if self.step and (self.step + self.resume_step) % self.save_interval != 0:
             self.save()
 
     def run_step(self, batch, cond):
@@ -236,7 +241,7 @@ class TrainLoop:
     def save(self):
         def save_checkpoint(rate, params):
             state_dict = self.mp_trainer.master_params_to_state_dict(params)
-            if dist.get_rank() == 0:
+            if dist_util.get_rank() == 0:
                 logger.log(f"saving model {rate}...")
                 if not rate:
                     filename = f"model{(self.step+self.resume_step):06d}.pt"
@@ -249,14 +254,15 @@ class TrainLoop:
         for rate, params in zip(self.ema_rate, self.ema_params):
             save_checkpoint(rate, params)
 
-        if dist.get_rank() == 0:
+        if dist_util.get_rank() == 0:
             with bf.BlobFile(
                 bf.join(get_blob_logdir(), f"opt{(self.step+self.resume_step):06d}.pt"),
                 "wb",
             ) as f:
                 th.save(self.opt.state_dict(), f)
 
-        dist.barrier()
+        if dist_util.is_dist_avail_and_initialized():
+            dist.barrier()
 
 
 def parse_resume_step_from_filename(filename):

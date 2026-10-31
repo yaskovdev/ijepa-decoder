@@ -3,6 +3,8 @@
 __pycache__/
 classify_image_graph_def.pb
 *.egg-info/
+/.venv/
+/artifacts/
 
 /log.txt
 /progress.csv

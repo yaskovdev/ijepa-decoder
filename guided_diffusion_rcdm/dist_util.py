@@ -6,6 +6,7 @@ import io
 import os
 import socket
 import sys
+from contextlib import nullcontext
 import blobfile as bf
 import torch as th
 import torch.distributed as dist
@@ -15,6 +16,7 @@ import torch.distributed as dist
 GPUS_PER_NODE = 8
 
 SETUP_RETRY_COUNT = 3
+_DEVICE = None
 
 def is_dist_avail_and_initialized():
     if not dist.is_available():
@@ -61,6 +63,16 @@ def setup_for_distributed(is_master):
 
 
 def init_distributed_mode(args):
+    device = set_device(getattr(args, "device", "auto"))
+    if device.type != "cuda":
+        world_size = int(os.environ.get("WORLD_SIZE", getattr(args, "world_size", 1)))
+        if world_size != 1:
+            raise ValueError("Multi-device training requires CUDA.")
+        args.rank, args.gpu, args.world_size = 0, 0, 1
+        args.device = device
+        print(f"Training on {device} without distributed initialization.")
+        return
+
     # launched with torch.distributed.launch
     if 'SLURM_PROCID' in os.environ and args.submitit:
         print("Distributed")
@@ -95,7 +107,7 @@ def init_distributed_mode(args):
         rank=args.rank,
     )
 
-    th.cuda.set_device(args.gpu)
+    args.device = set_device(f"cuda:{args.gpu}")
     print('| distributed init (rank {}): {}'.format(
         args.rank, args.dist_url), flush=True)
     dist.barrier()
@@ -104,16 +116,51 @@ def init_distributed_mode(args):
 
 def dev():
     """
-    Get the device to use for torch.distributed.
+    Get the configured training or sampling device.
     """
-    if th.cuda.is_available():
-        return th.device(f"cuda")
-    return th.device("cpu")
+    if _DEVICE is None:
+        return set_device()
+    return _DEVICE
+
+
+def set_device(device="auto"):
+    global _DEVICE
+    if device == "auto":
+        mps = getattr(th.backends, "mps", None)
+        device = (
+            "cuda" if th.cuda.is_available()
+            else "mps" if mps is not None and mps.is_available()
+            else "cpu"
+        )
+    device = th.device(device)
+    if device.type == "cuda":
+        if not th.cuda.is_available():
+            raise ValueError("CUDA was requested but is not available.")
+        device = th.device("cuda", device.index if device.index is not None else th.cuda.current_device())
+        th.cuda.set_device(device)
+    elif device.type == "mps":
+        mps = getattr(th.backends, "mps", None)
+        if mps is None or not mps.is_available():
+            raise ValueError("MPS was requested but is not available.")
+    elif device.type != "cpu":
+        raise ValueError(f"Unsupported device: {device}")
+    _DEVICE = device
+    return device
+
+
+def autocast(use_fp16=False):
+    if dev().type == "cuda":
+        return th.autocast("cuda", enabled=use_fp16)
+    if use_fp16:
+        raise ValueError("FP16 training is only supported on CUDA; use FP32 on MPS/CPU.")
+    return nullcontext()
 
 def sync_params(params):
     """
     Synchronize a sequence of Tensors across ranks from rank 0.
     """
+    if not is_dist_avail_and_initialized():
+        return
     for p in params:
         with th.no_grad():
             dist.broadcast(p, 0)
