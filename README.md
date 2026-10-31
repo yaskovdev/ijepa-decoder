@@ -4,6 +4,111 @@ An attempt to create a decoder for [I-JEPA](https://github.com/facebookresearch/
 
 Models requiring `vissl` currently can't be sampled from.
 
+## Small I-JEPA Predictor Decoder on Apple Silicon
+
+This pilot trains a small RCDM on **frozen official I-JEPA predictor outputs**,
+not on full-image encoder features. It is not Meta's unpublished decoder.
+The context encoder receives only visible patch tokens. The predictor receives
+the hidden block's positions, and its outputs are average-pooled into a
+1280-dimensional conditioning vector. The diffusion target is the corresponding
+RGB crop. Preparation verifies that changing hidden pixels does not change the
+conditioning.
+
+Use a separate environment. The commands below reuse an existing PyTorch 2.7.1
+installation; otherwise install the matching PyTorch/torchvision versions there.
+
+```shell
+python3 -m venv --system-site-packages .venv
+.venv/bin/python -m pip install -e . "torch==2.7.1" "torchvision==0.22.1"
+
+mkdir -p artifacts/checkpoints artifacts/data
+git clone --depth 1 https://github.com/facebookresearch/ijepa.git artifacts/ijepa
+curl --fail --location --continue-at - --output artifacts/checkpoints/IN1K-vit.h.14-300e.pth.tar https://dl.fbaipublicfiles.com/ijepa/IN1K-vit.h.14-300e.pth.tar
+curl --fail --location --continue-at - --output artifacts/data/imagenette2-160.tgz https://s3.amazonaws.com/fast-ai-imageclas/imagenette2-160.tgz
+tar -xzf artifacts/data/imagenette2-160.tgz -C artifacts/data
+
+.venv/bin/python -m scripts.ijepa_decoder prepare --device mps --train-limit 1000 --val-limit 64
+.venv/bin/python -m scripts.ijepa_decoder train --device mps --steps 2000
+.venv/bin/python -m scripts.ijepa_decoder sample --device mps --checkpoint artifacts/ijepa_decoder/ema_0.99_002000.pt
+```
+
+The full I-JEPA checkpoint is approximately 10.4 GB and includes the predictor;
+an encoder-only Hugging Face checkpoint is insufficient. Prepared features,
+checkpoints and grids are saved under the ignored `artifacts/` directory.
+Training and validation are cached separately. Once preparation exits, decoder
+training no longer needs I-JEPA in GPU memory.
+
+The short pilot uses 64x64 targets, a 32-channel U-Net, and EMA 0.99 rather than
+the original long-run EMA 0.9999. The grid shows the original, masked context,
+true target, multiple generated samples, and a different conditioning vector
+with the same initial noise. Generalization and sensitivity to conditioning,
+not only training loss, determine whether a larger run is worthwhile.
+
+An optional `train --predict-xstart` selects RCDM's existing clean-image
+prediction objective instead of noise prediction. Use a separate `--out-dir`
+when comparing objectives; sampling reads the matching objective from the saved
+configuration.
+
+**Pilot limitation:** With 1,000 Imagenette training crops, the initial
+2,000-step noise-prediction run still yields strongly colored, noisy images.
+A separate 500-step clean-image run yields generic blurred patterns. Neither
+is yet a convincing visualization of I-JEPA predictions; the wrong-conditioning
+control remains visually similar. This establishes local execution, not decoder
+quality.
+
+Resume with `train --steps TOTAL_STEPS --resume-checkpoint PATH_TO_MODEL_PT`.
+Keep the matching optimizer and EMA files in the same directory. Model settings
+are recorded in `decoder_config.json` and checked before resuming.
+The standard `scripts/image_train.py` also accepts `--device mps`,
+`--feature_cache PATH`, and `--max_steps TOTAL_STEPS`.
+
+The official I-JEPA source and weights are licensed
+[CC-BY-NC 4.0](https://github.com/facebookresearch/ijepa/blob/main/LICENSE).
+Their use is restricted to noncommercial purposes.
+
+### Frozen RCDM Prior and a Small Predictor Adapter
+
+This is the more useful starting point after preparing the I-JEPA caches.
+Keep the released DINO-RCDM generator frozen, and train only a small
+`1280 -> 512 -> 2048` adapter from predictor outputs to DINO features of the
+corresponding hidden RGB crops. I-JEPA is also frozen. Learning an image prior
+from scratch is no longer necessary.
+
+```shell
+curl --fail --location --continue-at - --output artifacts/checkpoints/dino_resnet50_pretrain.pth https://dl.fbaipublicfiles.com/dino/dino_resnet50_pretrain/dino_resnet50_pretrain.pth
+curl --fail --location --continue-at - --output artifacts/checkpoints/rcdm_ema_dino_trunk.pt https://dl.fbaipublicfiles.com/rcdm/rcdm_ema_dino_trunk.pt
+
+.venv/bin/python -m scripts.ijepa_adapter prepare --device mps
+.venv/bin/python -m scripts.ijepa_adapter sample --device mps --oracle-only --output artifacts/ijepa_adapter/oracle_baseline.png
+.venv/bin/python -m scripts.ijepa_adapter train --device mps --steps 2000
+.venv/bin/python -m scripts.ijepa_adapter sample --device mps --adapter artifacts/ijepa_adapter/best.pt
+```
+
+The additional weights total approximately 1.8 GB. DINO targets use 224x224 RGB
+in `[-1, 1]`, **without ImageNet or L2 normalization**, matching the original
+RCDM extraction code. Crops come from the cached original images and exact hidden
+boxes, not from upsampling the low-resolution diffusion targets. Model/geometry,
+image paths, and boxes are checked when pairing caches.
+
+Adapter normalization statistics come only from training features. `best.pt`
+is selected using validation feature error; `last.pt` is not necessarily better.
+In the initial 1,000-image run, the best recorded checkpoint was step 100 rather
+than step 2000. Its validation normalized MSE was 0.795 versus 0.961 for constant
+mean features; cosine similarity was 0.810 versus 0.641 with shuffled pairing.
+
+The grid columns are original, masked context, true target, **DINO oracle**,
+predictor samples, and wrong-predictor control. The oracle uses the true hidden
+RGB only as a decoder-quality reference. Predictor columns receive only the
+adapted predictor vector. DDIM uses identical initial noise for oracle,
+predictor sample 1, and the wrong-predictor control.
+
+The initial predictor grid contains recognizable vehicle, golf-ball and dog
+hypotheses, with a less faithful audio-equipment example. This is a small
+Imagenette proof of concept, not Meta's decoder or a full ImageNet evaluation.
+Validation is withheld from adapter training, not necessarily from the
+pretrained backbones or image prior. The released
+[RCDM weights are also noncommercial](https://dl.fbaipublicfiles.com/rcdm/LICENSE).
+
 ## Sample Using PyCharm on macOS with Remote Linux Interpreter
 
 ```shell
