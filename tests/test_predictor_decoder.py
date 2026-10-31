@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import torch as th
+from PIL import Image
 from torch import nn
 
 from guided_diffusion_rcdm import dist_util, logger
@@ -13,12 +14,14 @@ from guided_diffusion_rcdm.feature_datasets import (
     different_image_index, distinct_examples, load_feature_cache, load_feature_data,
 )
 from guided_diffusion_rcdm.gaussian_diffusion import _extract_into_tensor
-from guided_diffusion_rcdm.ijepa import PredictorAdapter, make_block_masks, predict_features, target_features
+from guided_diffusion_rcdm.ijepa import (
+    PredictorAdapter, make_block_masks, make_rectangle_masks, predict_features, target_features,
+)
 from guided_diffusion_rcdm.script_util import create_gaussian_diffusion, create_model
 from guided_diffusion_rcdm.train_util import TrainLoop
 from scripts.ijepa_decoder import feature_spec, sample
 from scripts.ijepa_decoder import hidden_crop, prediction_in_context
-from scripts import ijepa_adapter
+from scripts import ijepa_adapter, ijepa_paper_regions
 
 
 class PatchEncoder(nn.Module):
@@ -51,6 +54,39 @@ class PredictorDecoderTests(unittest.TestCase):
         changed[:, :, :2, :2] += 10
         visible_changed = predict_features(encoder, predictor, changed, context[None], target[None])
         self.assertFalse(th.equal(original, visible_changed))
+
+    def test_rectangular_mask_excludes_the_requested_patch_rows_and_columns(self):
+        context, target = make_rectangle_masks(0, 1, 2, 3, grid_size=4)
+        image = th.randn(1, 3, 8, 8)
+        changed = image.clone()
+        changed[:, :, :4, 2:8] = 1000
+        encoder, predictor = PatchEncoder(), ContextPredictor()
+        original = predict_features(encoder, predictor, image, context[None], target[None])
+        hidden_changed = predict_features(encoder, predictor, changed, context[None], target[None])
+        th.testing.assert_close(original, hidden_changed, rtol=0, atol=0)
+        with self.assertRaisesRegex(ValueError, "visible"):
+            make_rectangle_masks(0, 0, 4, 4, grid_size=4)
+
+    def test_native_hidden_pixels_cannot_leak_through_resizing(self):
+        original = np.random.default_rng(0).integers(256, size=(197, 197, 3), dtype=np.uint8)
+        source = Image.fromarray(original)
+        changed = source.copy()
+        changed.paste((255, 255, 255), (50, 11, 147, 109))
+        pixels = ijepa_paper_regions.prepare(source, (50, 11, 147, 109))[0]
+        hidden_changed = ijepa_paper_regions.prepare(changed, (50, 11, 147, 109))[0]
+        th.testing.assert_close(pixels, hidden_changed, rtol=0, atol=0)
+        np.testing.assert_array_equal(np.array(source), original)
+
+    def test_native_composite_crops_the_corresponding_part_of_the_aligned_prediction(self):
+        source = Image.new("RGB", (224, 224), (200, 100, 50))
+        y, x = np.indices((70, 70), dtype=np.uint8)
+        pixels = np.stack((x, y, np.zeros_like(x)), axis=-1)
+        prediction = th.from_numpy(pixels).permute(2, 0, 1)
+        result = ijepa_paper_regions.compose(source, (71, 85, 139, 153), (70, 84, 140, 154), prediction)
+        expected = np.array(source)
+        expected[85:153, 71:139] = pixels[1:69, 1:69]
+        np.testing.assert_array_equal(np.array(result), expected)
+        np.testing.assert_array_equal(np.array(source), np.full((224, 224, 3), (200, 100, 50)))
 
     def test_cache_rejects_unpaired_targets(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -190,9 +226,17 @@ class PredictorDecoderTests(unittest.TestCase):
             th.save(legacy, root / "legacy.pt")
             restored = ijepa_adapter.load_adapter(root / "legacy.pt", predictor["val"], dino_spec, "cpu")
             th.testing.assert_close(model(predictor["val"]["features"]), restored(predictor["val"]["features"]))
+            rectangle_cache = dict(predictor["val"], block_size=None)
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                ijepa_adapter.load_adapter(checkpoint, rectangle_cache, dino_spec, "cpu")
+            transferred = ijepa_adapter.load_adapter(
+                checkpoint, rectangle_cache, dino_spec, "cpu", allow_mask_transfer=True
+            )
+            th.testing.assert_close(model(predictor["val"]["features"]), transferred(predictor["val"]["features"]))
             with self.assertRaisesRegex(ValueError, "does not match"):
                 ijepa_adapter.load_adapter(
-                    checkpoint, dict(predictor["val"], ijepa_checkpoint="different.pt"), dino_spec, "cpu"
+                    checkpoint, dict(rectangle_cache, ijepa_checkpoint="different.pt"), dino_spec, "cpu",
+                    allow_mask_transfer=True,
                 )
 
     def test_target_ridge_uses_teacher_features_and_wrong_originals(self):

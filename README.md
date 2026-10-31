@@ -187,6 +187,44 @@ including dog-part crops: this is still semantic visualization, not faithful
 spatial inpainting. In the two inspected regions, 250 DDIM steps offered no
 clear semantic improvement over 100.
 
+### Four Regions from the Official I-JEPA README
+
+The official figure already contains decoded grayscale sketches inside its
+blue frames, not the original hidden RGB. The reference experiment removes
+those pixels and the frame before resizing, and excludes all intersecting
+patches from the context encoder. It never uses the supplied sketches as
+conditioning or ground-truth targets.
+
+After preparing the expanded predictor ridge 0.1, MLP 256, and target ridge 0.1
+checkpoints above:
+
+```shell
+mkdir -p artifacts/ijepa_paper_regions
+curl --fail --location --output artifacts/ijepa_paper_regions/source_figure.png https://github.com/facebookresearch/ijepa/assets/7530871/9b66e461-fc8b-4b12-9f06-63ec4dfc1452
+.venv/bin/python -m scripts.ijepa_paper_regions
+```
+
+Results are saved to `artifacts/ijepa_paper_regions/predictions.png`, with
+individual native-resolution composites and raw predictions in the same
+directory. All three adapters decode the same predictor vectors and share the
+first sampling noise. **Via target** is a target-trained adapter applied to
+predictor outputs, not an oracle. No true-hidden-RGB reference is available here.
+
+These approximately 197-pixel tiles are enlarged to 224 pixels. Their rectangles
+require 8x9 or 9x8 patch masks, versus the adapters' 7x7 training masks. The driver
+explicitly enables mask-geometry transfer while retaining frozen-model and
+normalization checks. Generated crops are mapped back into the exact original
+rectangles; every source pixel outside them is preserved. New image classes,
+thumbnail resolution, and changed mask geometry make this a transfer experiment,
+not an exact reproduction or quantitative comparison with Meta's decoder.
+
+In the four-region run, dog heads and building facades were recognizable, but
+breed and alignment varied. The bird's leg was not convincingly decoded; the
+wolf's legs remained ambiguous and poorly aligned. MLP and target-trained
+mapping did not resolve these failures. The second predictor sample sometimes
+changed the hypothesis substantially, so both samples also have in-context
+columns. These observations are qualitative, not reconstruction scores.
+
 ## Sample Using PyCharm on macOS with Remote Linux Interpreter
 
 ```shell

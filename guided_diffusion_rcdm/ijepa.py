@@ -57,13 +57,17 @@ def _load_ijepa_models(repo_dir, checkpoint_path, device, include_target):
 
 
 def make_block_masks(top, left, block_size=7, grid_size=16):
-    if not 0 < block_size < grid_size:
-        raise ValueError("block_size must leave both visible and hidden patches.")
-    if not (0 <= top <= grid_size - block_size and 0 <= left <= grid_size - block_size):
+    return make_rectangle_masks(top, left, block_size, block_size, grid_size)
+
+
+def make_rectangle_masks(top, left, height, width, grid_size=16):
+    if min(height, width) <= 0 or height * width >= grid_size * grid_size:
+        raise ValueError("Target masks must leave both visible and hidden patches.")
+    if not (0 <= top <= grid_size - height and 0 <= left <= grid_size - width):
         raise ValueError("Target block falls outside the patch grid.")
     indices = th.arange(grid_size * grid_size).reshape(grid_size, grid_size)
     hidden = th.zeros(grid_size, grid_size, dtype=th.bool)
-    hidden[top:top + block_size, left:left + block_size] = True
+    hidden[top:top + height, left:left + width] = True
     return indices[~hidden], indices[hidden]
 
 

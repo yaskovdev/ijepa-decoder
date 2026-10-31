@@ -224,12 +224,20 @@ def train(args):
     print(f"Saved best adapter to {out_dir / 'best.pt'}", flush=True)
 
 
-def load_adapter(path, predictor_cache, dino_spec, device):
+def load_adapter(path, predictor_cache, dino_spec, device, *, allow_mask_transfer=False):
     checkpoint = th.load(path, map_location="cpu", weights_only=True)
-    if (checkpoint["feature_spec"] != feature_spec(predictor_cache)
+    trained_spec, input_spec = checkpoint["feature_spec"].copy(), feature_spec(predictor_cache)
+    if allow_mask_transfer:
+        trained_spec.pop("block_size")
+        input_spec.pop("block_size")
+    if (trained_spec != input_spec
             or checkpoint["dino_spec"] != dino_spec
             or checkpoint["input_dim"] != predictor_cache["features"].shape[1]):
         raise ValueError("Adapter checkpoint does not match the frozen predictor or DINO feature extraction.")
+    if allow_mask_transfer and checkpoint["feature_spec"]["block_size"] != predictor_cache["block_size"]:
+        print(f"Mask geometry transfer: adapter trained on {checkpoint['feature_spec']['block_size']}x"
+              f"{checkpoint['feature_spec']['block_size']} patches; inference uses a different target shape.",
+              flush=True)
     source = checkpoint.get("feature_source", "predictor")
     if source not in ("predictor", "target") or (
             source == "target" and checkpoint.get("target_normalization") != "layer_norm_patch_tokens"):
