@@ -145,13 +145,47 @@ same one.
 
 The optional **IJEPA target** column uses the actual target encoder, which sees
 hidden pixels, through a target-trained adapter. **Via target** applies that
-same adapter to predictor outputs instead. These separate mapping limitations
-from information missing in the prediction; neither is an input to the primary
-predictor adapter. Target tokens are layer-normalized individually before
+same adapter to predictor outputs instead. These help diagnose mapping quality
+and predictor/target mismatch; the gap can reflect information loss or
+distribution shift, not just decoder error. Neither reference is an input to
+the primary predictor adapter. Target tokens are layer-normalized individually before
 masking and pooling, as in official I-JEPA training. **Reference** uses the
 previous adapter on the same examples and boxes. All reference columns and
 predictor sample 1 share the same DDIM noise. Use `--sampling-steps 250` for a
 separate sampling-budget comparison without changing the pretrained resolution.
+
+On the expanded caches, the best ridge strength was **0.1**. The smaller
+256-hidden-unit MLP was nearly tied. The following comparisons use the same
+768 validation regions, and all errors use the same DINO normalization scales
+fitted on the expanded training data:
+
+| Decoder input / adapter | Normalized feature MSE | DINO cosine |
+| --- | ---: | ---: |
+| Predictor / original 1,000-image MLP | 0.870 | 0.769 |
+| Predictor / expanded ridge 0.1 | **0.698** | **0.823** |
+| Predictor / expanded MLP 256 | 0.701 | 0.822 |
+| Actual I-JEPA target / target ridge 0.1 (oracle) | 0.619 | 0.847 |
+| Predictor / that same target ridge 0.1 | 0.752 | 0.805 |
+
+The expanded pipeline reduces held-out **feature** error by approximately 20%
+relative to the original adapter; this is not a pixel-reconstruction score.
+Predictor and target pooled vectors have mean cosine 0.961, but even small
+representation errors can affect the decoded image. The experiment remains
+restricted to Imagenette's ten classes and does not establish a universal decoder.
+Full metrics are in `artifacts/ijepa_adapter_320_results.json`.
+
+The selected predictor and target checkpoints are
+`artifacts/ijepa_adapter_320_ridge0.1/best.pt` and
+`artifacts/ijepa_target_adapter_320_ridge0.1/best.pt`.
+Controlled grids are `artifacts/ijepa_adapter_320_ridge0.1/comparison_100.png`
+and `comparison_250.png` in the same directory. The 100-step grid includes the
+old adapter on the new examples, target controls, and the in-context column;
+the 250-step grid uses the same first two examples and initial noises.
+
+The context column exposes persistent object-scale and alignment errors,
+including dog-part crops: this is still semantic visualization, not faithful
+spatial inpainting. In the two inspected regions, 250 DDIM steps offered no
+clear semantic improvement over 100.
 
 ## Sample Using PyCharm on macOS with Remote Linux Interpreter
 
