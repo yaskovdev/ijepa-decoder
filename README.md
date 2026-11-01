@@ -321,10 +321,85 @@ establish a qualitative improvement over the earlier DINO-RCDM route.
 Wrong-image and shuffled-token controls visibly alter the result; all three
 comparisons preserve visible pixels exactly outside the mask.
 
-The next useful experiment is a learned spatial upsampler with decoder-aware
-RGB/perceptual supervision rather than more latent-only regression. The pilot
-does not require rented GPUs; its current limitation is reconstruction
-quality, not Mac inference speed.
+The follow-up controls below separate spatial resolution from cross-encoder
+mapping before investing in a learned upsampler or a native I-JEPA decoder.
+The pilot does not require rented GPUs; its current limitation is
+reconstruction quality, not Mac inference speed.
+
+### Spatial and Nearest-Crop Diagnostics
+
+These experiments require no new training or dataset. They evaluate all 64
+held-out photographs and show the first eight, matching the earlier grids:
+
+```shell
+.venv/bin/python -m scripts.ijepa_diagnostics spatial-oracle --device mps --output artifacts/ijepa_diagnostics/spatial_oracle.png
+.venv/bin/python -m scripts.ijepa_diagnostics retrieve --device cpu --output artifacts/ijepa_diagnostics/retrieval.png
+```
+
+The spatial oracle uses real hidden-crop DINOv2 tokens, never predictor
+outputs. It compares the native 16x16 grid with downsampling to 7x7 and
+bilinear upsampling, optional per-token LayerNorm, and a closest representable
+7x7 grid computed by CPU float64 QR. This last control minimizes token MSE,
+not RGB error; it is not an upper bound on possible reconstruction quality.
+The LayerNorm controls are not constrained to the linear interpolation subspace.
+
+| Input to frozen RAE decoder | RGB MAE, 64 images | Token cosine |
+|---|---:|---:|
+| Native DINOv2 tokens | 0.052 | 1.000 |
+| Resize 16x16 to 7x7 to 16x16 | 0.096 | 0.906 |
+| Resize + output LayerNorm | 0.095 | 0.906 |
+| Closest representable 7x7 grid | 0.089 | 0.922 |
+| Closest grid + output LayerNorm | 0.088 | 0.922 |
+| Mean DINO token repeated everywhere | 0.177 | 0.759 |
+
+Resolution reduction visibly blurs fine details, but truck fronts, headset
+outlines, horn curves, and broad layout remain recognizable. On the exact
+first eight images, native DINO gives RGB MAE 0.047, simple resizing 0.086,
+and the closest grid with LayerNorm 0.078, versus 0.137 for the earlier mapped
+I-JEPA target control and 0.152 for its predictor. Spatial interpolation
+therefore contributes to the problem but does not explain the entire bridge
+failure. All these pixel errors use [0,1] RGB and are not semantic-quality
+scores.
+
+Retrieval compares pooled predictor outputs with true target-encoder
+features from the existing bank of 28,407 crops / 9,469 training photographs.
+It searches exact cosine similarity without FAISS or CUDA. Neighbor sets
+contain distinct original-photo pixel hashes, even though the bank has three
+masks per photograph; train/query pixel-hash overlap is rejected.
+Centering subtracts only the training target-bank mean before normalization.
+The command writes both `retrieval.png` and `retrieval_centered.png`, with
+top-three real crops, native-mask composites, target-oracle neighbors, and
+wrong-photo predictor controls. Corresponding `.json` / `.pt` files retain
+the source paths, boxes, similarities, indices, and measurements.
+
+| Retrieval query | Top-1 neighbor from the same original-photo class |
+|---|---:|
+| Predictor, cosine | 59/64 |
+| Predictor, centered cosine | 62/64 |
+| True target encoder, cosine | 62/64 |
+| True target encoder, centered cosine | 62/64 |
+| Wrong-photo predictor, either metric | 5/64 |
+
+Predictor and actual target pooled vectors have mean cosine 0.964. With plain
+cosine they choose the identical training crop in 46/64 cases. The first
+eight grids show relevant truck, dog/paw, audio-equipment, horn, and chainsaw
+neighbors; the wrong-photo control changes their content. All 128 raw and
+centered composites preserve pixels outside the native mask exactly.
+
+**Limitations:** retrieval copies real training crops; it does not generate a
+new reconstruction or reveal the unique hidden RGB. Imagenette classes label
+whole photographs, not their masked regions. Matching that class does not
+establish correct local content, pose, colors, or alignment, and a background
+mask can retrieve foreground from the same class. These are ten-class,
+image-disjoint diagnostics, not a claim of general predictor accuracy.
+Held out here means separate from our adapter training and retrieval bank;
+Imagenette's ImageNet origin does not guarantee separation from frozen
+encoder pretraining.
+
+**Outcome:** both requested diagnostics are informative, so the conditional
+native I-JEPA decoder fallback was not started. Predictor features select
+meaningful real neighbors even when the learned RAE bridge produces blur;
+that bridge should not be used alone to judge what the predictor represents.
 
 ## Sample Using PyCharm on macOS with Remote Linux Interpreter
 
