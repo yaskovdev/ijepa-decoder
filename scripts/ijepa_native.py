@@ -35,11 +35,16 @@ def load_native_cache(path):
     height, width = cache["spatial_shape"]
     for name in ("predictor_tokens", "target_tokens"):
         values = cache[name]
-        if (values.shape != (count, height * width, dimension) or not values.is_floating_point()
+        if (not isinstance(values, th.Tensor) or values.shape != (count, height * width, dimension)
+                or not values.is_floating_point()
                 or not th.isfinite(values).all()):
             raise ValueError(f"Native cache contains invalid {name}.")
-    if cache["originals"].shape[-2:] != (224, 224):
-        raise ValueError("Native reconstruction needs the aligned 224-pixel originals.")
+    originals = cache["originals"]
+    if (not isinstance(originals, th.Tensor) or originals.ndim != 4
+            or originals.shape[1:] != (3, 224, 224) or originals.dtype != th.uint8):
+        raise ValueError("Native reconstruction needs uint8 aligned 224-pixel originals.")
+    if not isinstance(cache["boxes"], th.Tensor) or cache["boxes"].shape != (count, 4):
+        raise ValueError("Native reconstruction needs one aligned box per token sequence.")
     mask_order(cache["boxes"], cache["spatial_shape"])
     example_hashes(cache)
     return cache

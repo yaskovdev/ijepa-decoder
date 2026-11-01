@@ -8,7 +8,7 @@ import torch as th
 from guided_diffusion_rcdm.ijepa_reconstruction import (
     NativeDecoder, initialization_spec, mask_order, resize_rgb_head,
 )
-from scripts.ijepa_native import native_crops, native_spec, restore_native
+from scripts.ijepa_native import load_native_cache, native_crops, native_spec, restore_native
 
 
 class NativeDecoderTests(unittest.TestCase):
@@ -44,6 +44,26 @@ class NativeDecoderTests(unittest.TestCase):
         actual = native_crops(cache)
         expected = th.tensor([99, 11], dtype=th.uint8)[:, None, None, None].expand(2, 3, 28, 42)
         th.testing.assert_close(actual, expected)
+
+    def test_native_cache_rejects_unpaired_boxes_and_non_tensor_tokens(self):
+        cache = dict(features=th.zeros(2, 8), targets=th.zeros(2, 3, 256, 256, dtype=th.uint8),
+                     originals=th.zeros(2, 3, 224, 224, dtype=th.uint8), image_hashes=["first", "second"],
+                     image_indices=th.tensor([0, 1]), image_paths=["first", "second"], paths=["first", "second"],
+                     predictor_tokens=th.randn(2, 6, 8), target_tokens=th.randn(2, 6, 8),
+                     boxes=th.tensor([[28, 14, 70, 42], [140, 140, 182, 168]]),
+                     input_size=224, patch_size=14, spatial_shape=[2, 3],
+                     target_normalization="layer_norm_patch_tokens")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cache.pt"
+            th.save(cache, path)
+            th.testing.assert_close(load_native_cache(path)["boxes"], cache["boxes"])
+            for change, message in [
+                (dict(boxes=cache["boxes"][:1]), "one aligned box"),
+                (dict(predictor_tokens=None), "invalid predictor_tokens"),
+            ]:
+                th.save(dict(cache, **change), path)
+                with self.assertRaisesRegex(ValueError, message):
+                    load_native_cache(path)
 
     @unittest.skipUnless(importlib.util.find_spec("transformers"), "Native optional dependencies are absent")
     def test_native_rgb_forward_and_backward_need_only_tokens_and_geometry(self):

@@ -441,6 +441,55 @@ retrieved training crops. They cannot establish the unique hidden image.
 Native 98x98 errors are not directly comparable with earlier 256x256 RAE
 errors without evaluating both on the same RGB target and resolution.
 
+**Measured MPS run:** the target stage took 118 seconds; mixed continuation
+took 95 seconds, including periodic validation and checkpoint writes.
+The decoder has 26.3 million parameters. Predictor validation selected step
+400, not the final step 800. On all 64 held-out photographs:
+
+| Decoder input | RGB MAE | AlexNet LPIPS |
+|---|---:|---:|
+| Training-only mean-crop baseline | 0.243 | 0.912 |
+| Target tokens, target-trained decoder | 0.101 | 0.232 |
+| Predictor tokens, target-trained decoder | 0.134 | 0.368 |
+| Target tokens, mixed decoder | 0.097 | 0.216 |
+| Predictor tokens, mixed decoder | 0.128 | 0.336 |
+| Wrong-photo predictor, mixed decoder | 0.300 | 0.697 |
+| Shuffled predictor tokens, mixed decoder | 0.197 | 0.526 |
+
+For a fair cross-decoder comparison, the existing RAE outputs for the same
+first eight photographs were downsampled on CPU to 98x98 using antialiased
+bilinear interpolation. Both methods were scored against the same original
+hidden RGB crops, with rendered [0,1] RGB:
+
+| Method, first eight photographs | RGB MAE | AlexNet LPIPS |
+|---|---:|---:|
+| RAE, true DINOv2 oracle | 0.045 | 0.072 |
+| RAE, mapped I-JEPA target tokens | 0.137 | 0.480 |
+| Native decoder, I-JEPA target tokens | 0.095 | 0.249 |
+| RAE, mapped predictor tokens | 0.153 | 0.599 |
+| Native predictor before adaptation | 0.123 | 0.325 |
+| Native predictor after adaptation | 0.123 | 0.305 |
+
+`artifacts/ijepa_native/comparison.png` shows the first eight; the primary
+columns are **native predictor** and **in context**. The truck front, headset
+contour, horn bell, and orange chainsaw body are more recognizable than in
+the mapped RAE pilot. Geometry, texture, colors, and seams remain imperfect.
+All eight composites preserve visible pixels exactly.
+`results.json` and `matched_rae_controls.json` retain the measurements.
+
+**Outcome:** direct decoding is a meaningful improvement over the DINO
+bridge; adaptation adds a modest gain rather than another qualitative jump.
+Wrong-photo conditioning changes content, and shuffling worsens spatial
+reconstruction despite preserving the token mean. The target oracle is still
+better than predictor decoding, and true-DINO reconstruction remains better
+than either I-JEPA route. These results do not separate irreducible predictor
+uncertainty from remaining decoder/data limitations. The ten-class,
+2,048-photo training set and fixed 7x7 mask geometry also limit transfer:
+larger rectangular paper masks require explicit geometry transfer, not an
+interchangeable checkpoint. More identical-data mixed-training steps did not
+clearly improve validation after step 400; rented GPUs are not needed to run
+this pilot.
+
 ## Sample Using PyCharm on macOS with Remote Linux Interpreter
 
 ```shell
