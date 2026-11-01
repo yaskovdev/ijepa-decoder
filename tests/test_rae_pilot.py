@@ -6,6 +6,10 @@ from pathlib import Path
 import torch as th
 
 from guided_diffusion_rcdm.rae import SpatialAdapter, cache_dino_positions, rae_spec, regrid
+from scripts.ijepa_diagnostics import (
+    nearest_examples, parser as diagnostics_parser, project_grid, retrieve, retrieval_features,
+    validate_retrieval_caches,
+)
 from scripts.ijepa_rae import restore_adapter, spatial_spec
 
 
@@ -107,3 +111,84 @@ class RaePilotTests(unittest.TestCase):
                             dict(cache, rae_spec=dict(rae_spec(), encoder_revision="different"))):
                 with self.assertRaisesRegex(ValueError, "differs"):
                     restore_adapter(path, changed, "cpu")
+
+    def test_grid_projection_preserves_representable_maps_and_beats_plain_resize(self):
+        coarse = th.randn(2, 6, 3)
+        representable = regrid(coarse, (2, 3))
+        th.testing.assert_close(project_grid(representable, (2, 3)), representable, atol=1e-6, rtol=1e-6)
+        full = th.randn(2, 256, 3)
+        projected = project_grid(full, (7, 7))
+        resized = regrid(regrid(full, (16, 16), output_size=7), (7, 7))
+        self.assertLess((projected - full).square().mean().item(), (resized - full).square().mean().item())
+        th.testing.assert_close(project_grid(projected, (7, 7)), projected, atol=1e-6, rtol=1e-6)
+        if th.backends.mps.is_available():
+            th.testing.assert_close(project_grid(full.to("mps"), (7, 7)).cpu(), projected,
+                                    atol=1e-6, rtol=1e-6)
+        with self.assertRaisesRegex(ValueError, "source grid"):
+            project_grid(full, (17, 7))
+
+    def test_retrieval_cosine_returns_distinct_originals_not_duplicate_masks(self):
+        bank = th.tensor([[2., 0.], [1., 0.01], [0.8, 0.6], [-1., 0.]])
+        queries = th.tensor([[1., 0.], [-1., 0.]])
+        indices, scores = nearest_examples(bank, queries, ["a", "a", "b", "c"], top_k=2)
+        self.assertEqual(indices.tolist(), [[0, 2], [3, 2]])
+        th.testing.assert_close(scores[0], th.tensor([1., 0.8]))
+        with self.assertRaisesRegex(ValueError, "distinct original"):
+            nearest_examples(bank, queries, ["a", "a", "b", "c"], top_k=4)
+        with self.assertRaisesRegex(ValueError, "zero-norm"):
+            nearest_examples(th.ones(3, 2), queries, ["a", "b", "c"], top_k=1, center=True)
+
+    def test_retrieval_supports_pooled_and_spatial_targets_and_rejects_leakage(self):
+        spec = dict(conditioning="ijepa_predictor", input_size=224, patch_size=14, block_size=7,
+                    ijepa_epoch=299, ijepa_checkpoint="frozen.pt", target_normalization="layer_norm_patch_tokens")
+        bank = dict(spec, features=th.ones(3, 2), target_features=th.randn(3, 2),
+                    image_indices=th.tensor([0, 0, 1]), image_hashes=["train-a", "train-b"])
+        query = dict(spec, features=th.ones(2, 2), target_tokens=th.randn(2, 4, 2),
+                     image_indices=th.tensor([0, 1]), image_hashes=["val-a", "val-b"])
+        bank_hashes, query_hashes = validate_retrieval_caches(bank, query)
+        self.assertEqual(bank_hashes, ["train-a", "train-a", "train-b"])
+        self.assertEqual(query_hashes, ["val-a", "val-b"])
+        th.testing.assert_close(retrieval_features(query, "target"), query["target_tokens"].mean(1))
+        for changed, message in (
+            (dict(query, image_hashes=["train-a", "val-b"]), "share original"),
+            (dict(query, ijepa_epoch=300), "differ"),
+            (dict(query, target_normalization="pooled_layer_norm"), "differ"),
+        ):
+            with self.assertRaisesRegex(ValueError, message):
+                validate_retrieval_caches(bank, changed)
+
+    def test_retrieval_driver_renders_real_crops_without_changing_visible_pixels(self):
+        def cache(paths, hashes, features):
+            count = len(paths)
+            originals = th.arange(count, dtype=th.uint8)[:, None, None, None].expand(
+                count, 3, 224, 224).clone() * 40
+            return dict(
+                features=features, target_features=features.clone(),
+                originals=originals, targets=th.zeros(count, 3, 128, 128, dtype=th.uint8),
+                image_indices=th.arange(count), image_paths=paths, paths=paths, image_hashes=hashes,
+                boxes=th.tensor([[14, 14, 112, 112]]).expand(count, 4).clone(),
+                conditioning="ijepa_predictor", input_size=224, patch_size=14, block_size=7,
+                ijepa_epoch=299, ijepa_checkpoint="frozen.pt", target_normalization="layer_norm_patch_tokens",
+            )
+
+        bank = cache(["train/a", "train/b", "train/c"], ["a", "b", "c"],
+                     th.tensor([[1., 0.], [0., 1.], [-1., 0.]]))
+        query = cache(["val/d", "val/e"], ["d", "e"], th.tensor([[0.9, 0.1], [-0.9, 0.1]]))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            th.save(bank, root / "bank.pt")
+            th.save(query, root / "query.pt")
+            args = diagnostics_parser().parse_args([
+                "retrieve", "--bank", str(root / "bank.pt"), "--cache", str(root / "query.pt"),
+                "--top-k", "2", "--output", str(root / "retrieval.png"),
+            ])
+            retrieve(args)
+            self.assertTrue((root / "retrieval_centered.png").is_file())
+            output = th.load(root / "retrieval.pt", weights_only=True)
+            self.assertEqual(output["output_type"], "retrieved_training_rgb_crops")
+            self.assertFalse(output["primary_uses_hidden_rgb"])
+            visible = th.ones(224, 224, dtype=th.bool)
+            visible[14:112, 14:112] = False
+            for row in range(2):
+                for composite in output["composites"][row]:
+                    th.testing.assert_close(composite[:, visible], query["originals"][row, :, visible])
