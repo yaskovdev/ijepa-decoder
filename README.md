@@ -396,10 +396,50 @@ Held out here means separate from our adapter training and retrieval bank;
 Imagenette's ImageNet origin does not guarantee separation from frozen
 encoder pretraining.
 
-**Outcome:** both requested diagnostics are informative, so the conditional
-native I-JEPA decoder fallback was not started. Predictor features select
+**Outcome:** both requested diagnostics were informative, so the conditional
+native decoder fallback was not started during that stage. Predictor features select
 meaningful real neighbors even when the learned RAE bridge produces blur;
 that bridge should not be used alone to judge what the predictor represents.
+
+### Native I-JEPA Reconstruction Pilot
+
+This continuation removes the DINO bridge. A trainable decoder receives only
+the 7x7 I-JEPA patch tokens and their known positions in the native 16x16 grid.
+It initializes transformer blocks from the pinned `facebook/vit-mae-base`
+decoder, with a new 1280-to-512 input projection, native fixed position
+embeddings, and an RGB head resized from 16-pixel to 14-pixel patches.
+The MAE encoder is not used. The CLS-like input is a mean of normalized
+I-JEPA patch tokens, not an unavailable I-JEPA CLS token.
+
+Training uses the existing 2,048/64 spatial caches, but RGB targets are the
+original **98x98** masked crops, not their upscaled 256x256 RAE versions.
+The objective is raw RGB L1 + 0.5 frozen AlexNet LPIPS. RGB denormalization
+uses fixed ImageNet statistics; no hidden-patch color statistics or hidden
+RGB enter predictor inference. A training-only mean crop supplies the
+validation baseline. Encoders remain frozen, and train/validation pixel-hash
+overlap and incompatible feature/checkpoint contracts are rejected.
+
+```shell
+.venv/bin/python -m pip install -e '.[native]'
+.venv/bin/python -m scripts.ijepa_native assets
+.venv/bin/python -m scripts.ijepa_native train --device mps --feature-source target --steps 1000 --out-dir artifacts/ijepa_native/target_1000
+.venv/bin/python -m scripts.ijepa_native train --device mps --feature-source mixed --steps 800 --learning-rate 5e-5 --init artifacts/ijepa_native/target_1000/best.pt --out-dir artifacts/ijepa_native/mixed_800
+.venv/bin/python -m scripts.ijepa_native sample --device mps --target-decoder artifacts/ijepa_native/target_1000/best.pt --decoder artifacts/ijepa_native/mixed_800/best.pt --output artifacts/ijepa_native/comparison.png
+```
+
+The target-token stage is an oracle that sees hidden RGB through the frozen
+target encoder. The mixed continuation alternates target and predictor
+examples within each batch and selects checkpoints by held-out predictor
+reconstruction. `--init` starts a new optimization run from weights; it is
+not an optimizer-state resume. Each experiment needs a new output directory.
+The comparison includes both decoders' target controls, predictor before and
+after adaptation, an exact native-mask composite, wrong-photo conditioning,
+and a permutation that preserves the predictor token mean.
+
+These are **deterministic learned reconstructions**, not RCDM samples or
+retrieved training crops. They cannot establish the unique hidden image.
+Native 98x98 errors are not directly comparable with earlier 256x256 RAE
+errors without evaluating both on the same RGB target and resolution.
 
 ## Sample Using PyCharm on macOS with Remote Linux Interpreter
 
