@@ -36,6 +36,24 @@ def averaged(errors, weight):
     return result
 
 
+def paired_difference(baseline, prediction, hashes, seed):
+    photographs = {}
+    for index, digest in enumerate(hashes):
+        photographs.setdefault(digest, []).append(index)
+    generator = th.Generator().manual_seed(seed)
+    bootstrap = th.randint(len(photographs), (2000, len(photographs)), generator=generator)
+    result = {}
+    for name in ("rgb_mae", "lpips", "raw_l1"):
+        delta = th.tensor(prediction["per_example"][name], dtype=th.float64) - th.tensor(
+            baseline["per_example"][name], dtype=th.float64,
+        )
+        per_photo = th.stack([delta[indices].mean() for indices in photographs.values()])
+        limits = th.quantile(per_photo[bootstrap].mean(1), th.tensor([0.025, 0.975], dtype=th.float64))
+        result[name] = dict(new_minus_baseline=per_photo.mean().item(), paired_95_percent_ci=limits.tolist(),
+                            photographs=len(photographs))
+    return result
+
+
 @th.no_grad()
 def metrics(model, cache, crops, source, perceptual, device, weight, batch_size, per_example=False):
     previous = model.training

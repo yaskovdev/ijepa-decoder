@@ -26,6 +26,15 @@ def example_hashes(cache):
     return [cache["image_hashes"][index] for index in cache["image_indices"].tolist()]
 
 
+def different_image_index(cache, index):
+    original = cache["image_hashes"][cache["image_indices"][index].item()]
+    for offset in range(1, len(cache["image_indices"])):
+        candidate = (index + offset) % len(cache["image_indices"])
+        if cache["image_hashes"][cache["image_indices"][candidate].item()] != original:
+            return candidate
+    raise ValueError("Wrong-conditioning controls require at least two distinct original images.")
+
+
 def finite_tokens(tokens):
     return all(th.isfinite(tokens[start:start + 128]).all().item()
                for start in range(0, len(tokens), 128))

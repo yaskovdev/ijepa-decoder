@@ -5,10 +5,13 @@ from pathlib import Path
 import torch as th
 from PIL import ImageDraw
 
-from .data import generate_manifest, prepare
+from .data import (
+    crop_targets, different_image_index, example_hashes, generate_manifest, input_spec,
+    load_cache, original_for_example, prepare,
+)
 from .encoder import IJEPA_CHECKPOINT, load_ijepa, make_masks, predict_tokens
 from .io import (
-    as_image, compose, configure, download_file, image_pixels, normalized, rgb_pixels, save_cache, save_grid,
+    as_image, compose, configure, download_file, image_pixels, normalized, rgb_pixels, save_cache, save_grid, save_json,
 )
 from .model import download_assets, load_decoder
 
@@ -68,6 +71,73 @@ def decode(args):
     print(f"Saved {output}; mask coordinates refer to the 224x224 center-cropped view.", flush=True)
 
 
+@th.no_grad()
+def compare(args):
+    from .training import metrics, paired_difference, perceptual_loss
+
+    if min(args.num_images, args.batch_size) <= 0:
+        raise ValueError("Comparison needs positive image and batch counts.")
+    device = configure(args)
+    cache = load_cache(args.cache)
+    if args.num_images > len(cache["predictor_tokens"]):
+        raise ValueError("Requested comparison images exceed the validation cache.")
+    model, metadata = load_decoder(args.decoder, device, input_spec(cache))
+    baseline, baseline_metadata = load_decoder(args.baseline, device, input_spec(cache))
+    if any(record["feature_source"] not in ("predictor", "mixed") for record in (metadata, baseline_metadata)):
+        raise ValueError("Primary comparisons require predictor-trained decoders, not target-only oracles.")
+    perceptual, crops = perceptual_loss(device, args.models_dir), crop_targets(cache)
+    wrong = th.tensor([different_image_index(cache, index) for index in range(len(crops))])
+    permutation = th.randperm(cache["predictor_tokens"].shape[1], generator=th.Generator().manual_seed(args.seed))
+    wrong_cache = dict(cache, predictor_tokens=cache["predictor_tokens"][wrong])
+    shuffled_cache = dict(cache, predictor_tokens=cache["predictor_tokens"][:, permutation])
+    cases = [
+        ("v0.1_predictor", baseline, cache, "predictor"),
+        ("scaled_predictor", model, cache, "predictor"),
+        ("target_encoder_control", model, cache, "target"),
+        ("wrong_predictor", model, wrong_cache, "predictor"),
+        ("shuffled_tokens", model, shuffled_cache, "predictor"),
+    ]
+    report = {}
+    for name, network, features, source in cases:
+        report[name] = metrics(network, features, crops, source, perceptual, device, 0.5, args.batch_size,
+                               per_example=True)
+        print(f"{name}: { {key: report[name][key] for key in ('rgb_mae', 'lpips', 'score')} }", flush=True)
+    hashes = example_hashes(cache)
+    summary = dict(
+        metrics=report, paired_difference=paired_difference(report["v0.1_predictor"],
+                                                           report["scaled_predictor"], hashes, args.seed),
+        image_hashes=hashes, boxes=cache["boxes"].tolist(), training_step=metadata["training_step"],
+        baseline_training_step=baseline_metadata["training_step"], primary_uses_hidden_rgb=False,
+        oracle_uses_hidden_rgb=True, wrong_control_geometry_matched=th.equal(cache["boxes"], cache["boxes"][wrong]),
+    )
+    rows, samples, composites = [], [], []
+    for index in range(args.num_images):
+        box = cache["boxes"][index:index + 1]
+        decoded = rgb_pixels(th.cat([
+            network(features[f"{source}_tokens"][index:index + 1].float().to(device), box)
+            for _, network, features, source in cases
+        ]))
+        original = original_for_example(cache, index)
+        x0, y0, x1, y1 = box[0].tolist()
+        marked = as_image(original)
+        ImageDraw.Draw(marked).rectangle((x0, y0, x1 - 1, y1 - 1), outline="lime", width=2)
+        context = original.clone()
+        context[:, y0:y1, x0:x1] = 128
+        composite = compose(original, decoded[1], box[0].tolist())
+        rows.append([marked, as_image(context), as_image(crops[index]), as_image(decoded[0]),
+                     as_image(decoded[1]), as_image(composite), as_image(decoded[3]), as_image(decoded[4])])
+        samples.append(decoded)
+        composites.append(composite)
+    save_grid(rows, ["original", "context", "true target", "v0.1 predictor", "scaled predictor",
+                     "in context", "wrong predictor", "shuffled tokens"], args.output)
+    output = Path(args.output)
+    save_json(summary, output.with_suffix(".json"))
+    save_cache(dict(samples=th.stack(samples), sample_labels=[name for name, *_ in cases],
+                    composites=th.stack(composites), primary_uses_hidden_rgb=False),
+               output.with_suffix(".pt"))
+    print(f"Saved {output}; paired differences below zero favor the scaled model.", flush=True)
+
+
 def parser():
     result = argparse.ArgumentParser(description="Unofficial I-JEPA predictor-to-RGB decoder.")
     common = argparse.ArgumentParser(add_help=False)
@@ -124,6 +194,13 @@ def parser():
     command.add_argument("--decoder", default="artifacts/checkpoints/native")
     command.add_argument("--batch-size", type=int, default=8)
     command.add_argument("--output", help="Save metrics and paired per-example errors as JSON.")
+    command = commands.add_parser("compare", parents=[common])
+    command.add_argument("--cache", default="artifacts/scaled/features/val.pt")
+    command.add_argument("--decoder", required=True)
+    command.add_argument("--baseline", default="artifacts/checkpoints/native")
+    command.add_argument("--batch-size", type=int, default=8)
+    command.add_argument("--num-images", type=int, default=8)
+    command.add_argument("--output", default="artifacts/scaled/comparison.png")
     return result
 
 
@@ -134,7 +211,7 @@ def main():
 
         {"train": train, "evaluate": evaluate}[args.command](args)
     else:
-        {"download": download, "assets": assets, "decode": decode, "manifest": generate_manifest,
+        {"download": download, "assets": assets, "decode": decode, "compare": compare, "manifest": generate_manifest,
          "prepare": prepare}[args.command](args)
 
 

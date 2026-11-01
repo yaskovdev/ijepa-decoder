@@ -118,6 +118,8 @@ for source in predictor mixed; do
     --steps 15000 --batch-size 16 --learning-rate 5e-5 --schedule cosine \
     --min-learning-rate 1e-6 --ema-decay 0.999 --eval-every 250
 done
+ijepa-decoder compare --decoder artifacts/scaled/predictor/best.pt --output artifacts/scaled/predictor_comparison.png
+ijepa-decoder compare --decoder artifacts/scaled/mixed/best.pt --output artifacts/scaled/mixed_comparison.png
 ```
 
 Preparation processes bounded shards, reuses each target-encoder pass across
@@ -132,6 +134,11 @@ EMA, and random states. Resume in the same output directory with the original
 arguments, replacing `--init ...` with `--resume .../last.pt`. `--stop-after`
 pauses at an absolute step without shortening the full `--steps` schedule.
 Constant learning rate and no EMA remain the defaults for the published recipe.
+Comparisons use identical predictor features for both models, include wrong-photo
+and shuffled-token controls, and report paired bootstrap intervals grouped by
+original photograph. The target-encoder control is explicitly separate from the
+predictor-only visualization. Use the original small validation cache with
+`compare --cache artifacts/features/val.pt` for the fixed 64-image comparison.
 
 ## Tests and Attribution
 

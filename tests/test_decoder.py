@@ -13,7 +13,7 @@ from ijepa_decoder import cli, data
 from ijepa_decoder.encoder import IJEPA_CHECKPOINT
 from ijepa_decoder.io import compose, download_file, image_pixels
 from ijepa_decoder.model import NativeDecoder, initialization_spec, load_decoder, mask_order, resize_rgb_head
-from ijepa_decoder.training import evaluate, train
+from ijepa_decoder.training import evaluate, paired_difference, train
 
 
 def fake_encoder(images, masks=None):
@@ -298,6 +298,47 @@ class DecoderTests(unittest.TestCase):
                                                               "--resume", str(root / "resumed/last.pt")])
             with self.assertRaisesRegex(ValueError, "training settings"):
                 train(incompatible)
+
+    def test_comparison_reports_predictor_controls_and_preserves_visible_rgb(self):
+        class Decoder(th.nn.Module):
+            def forward(self, tokens, boxes):
+                return tokens[:, 0, :3].sigmoid()[:, :, None, None].expand(-1, -1, 98, 98)
+
+        def perceptual(prediction, target):
+            return (prediction - target).square().mean((1, 2, 3), keepdim=True)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            originals = th.stack([th.full((3, 224, 224), value, dtype=th.uint8) for value in (50, 150)])
+            cache = dict(predictor_tokens=th.randn(2, 49, 4).half(), target_tokens=th.randn(2, 49, 4).half(),
+                         originals=originals, boxes=th.tensor([[28, 14, 126, 112]] * 2), image_indices=th.arange(2),
+                         image_hashes=[data.pixel_hash(image) for image in originals], conditioning="ijepa_predictor",
+                         input_size=224, patch_size=14, block_size=7, ijepa_epoch=299, ijepa_checkpoint=IJEPA_CHECKPOINT,
+                         spatial_shape=[7, 7], target_normalization="layer_norm_patch_tokens")
+            th.save(cache, root / "val.pt")
+            args = cli.parser().parse_args(["compare", "--device", "cpu", "--cache", str(root / "val.pt"),
+                                            "--decoder", "test-decoder", "--num-images", "2",
+                                            "--output", str(root / "comparison.png")])
+            with patch.object(cli, "load_decoder", return_value=(Decoder(), dict(feature_source="mixed", training_step=0))), \
+                    patch("ijepa_decoder.training.perceptual_loss", return_value=perceptual):
+                cli.compare(args)
+            summary = json.loads((root / "comparison.json").read_text())
+            self.assertFalse(summary["primary_uses_hidden_rgb"])
+            self.assertIn("wrong_predictor", summary["metrics"])
+            self.assertIn("shuffled_tokens", summary["metrics"])
+            self.assertEqual(summary["paired_difference"]["rgb_mae"]["new_minus_baseline"], 0)
+            saved = th.load(root / "comparison.pt", weights_only=True)
+            self.assertEqual(saved["samples"].shape, (2, 5, 3, 98, 98))
+            visible = th.ones(224, 224, dtype=th.bool)
+            visible[14:112, 28:126] = False
+            th.testing.assert_close(saved["composites"][0, :, visible], originals[0, :, visible])
+
+    def test_paired_intervals_weight_photographs_not_their_number_of_masks(self):
+        baseline = dict(per_example={name: [0.4, 0.4, 0.1] for name in ("rgb_mae", "lpips", "raw_l1")})
+        prediction = dict(per_example={name: [0.1, 0.1, 0.5] for name in ("rgb_mae", "lpips", "raw_l1")})
+        result = paired_difference(baseline, prediction, ["photo-a", "photo-a", "photo-b"], 0)
+        self.assertAlmostEqual(result["rgb_mae"]["new_minus_baseline"], 0.05)
+        self.assertEqual(result["rgb_mae"]["photographs"], 2)
 
 
 if __name__ == "__main__":
