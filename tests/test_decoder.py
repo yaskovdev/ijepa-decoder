@@ -129,6 +129,15 @@ class DecoderTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "wrong checksum"):
                 download_file(source.as_uri(), root / "invalid", hashlib.sha256(b"other").hexdigest())
 
+    def test_download_selects_latest_or_pinned_initializer_release(self):
+        for arguments, version in (([], "v0.2.0"), (["--version", "v0.1.0"], "v0.1.0")):
+            with self.subTest(version=version):
+                args = cli.parser().parse_args(["download", *arguments])
+                with patch.object(cli, "download_file", side_effect=lambda url, path, checksum: path) as downloads:
+                    cli.download(args)
+                self.assertEqual(downloads.call_count, 3)
+                self.assertTrue(all(f"/{version}/" in call.args[0] for call in downloads.call_args_list))
+
     def test_image_inference_never_uses_hidden_pixels_or_a_target_encoder(self):
         def predictor(context, context_indices, target_indices):
             return fake_predictor(context, context_indices, target_indices).repeat(1, 1, 320)

@@ -14,19 +14,28 @@ The true target is a comparison, not an input to prediction.
 
 ## Pretrained Decoder
 
-**[Download v0.1.0](https://github.com/yaskovdev/ijepa-decoder/releases/tag/v0.1.0)**
+**[Download v0.2.0](https://github.com/yaskovdev/ijepa-decoder/releases/tag/v0.2.0)**
 or use `ijepa-decoder download` below. The release contains
-[105 MB safetensors weights](https://github.com/yaskovdev/ijepa-decoder/releases/download/v0.1.0/model.safetensors),
-[config](https://github.com/yaskovdev/ijepa-decoder/releases/download/v0.1.0/config.json),
+[105 MB safetensors weights](https://github.com/yaskovdev/ijepa-decoder/releases/download/v0.2.0/model.safetensors),
+[config](https://github.com/yaskovdev/ijepa-decoder/releases/download/v0.2.0/config.json),
 the model license, and
-[SHA256SUMS](https://github.com/yaskovdev/ijepa-decoder/releases/download/v0.1.0/SHA256SUMS).
+[SHA256SUMS](https://github.com/yaskovdev/ijepa-decoder/releases/download/v0.2.0/SHA256SUMS).
 Checksums are verified by the downloader. Weights are release assets, not git blobs.
 
 The decoder has **26.3 million parameters**, is initialized from MAE-base, and
 maps 49 unpooled I-JEPA ViT-H/14 predictor tokens plus their native positions
-to a **98x98 RGB crop**. The released mixed-training checkpoint was selected
-at step **400**, not the final step 800 and not a target-encoder oracle.
-On all 64 validation photographs, RGB MAE is **0.128089**, LPIPS **0.335584**.
+to a **98x98 RGB crop**. The released checkpoint is **mixed-training EMA at step
+10,750**, selected from a 15,000-step run on 9,469 photographs with four masks each.
+It is not a target-encoder oracle.
+
+| Predictor evaluation (lower is better) | v0.1 RGB MAE | v0.2 RGB MAE | v0.1 LPIPS | v0.2 LPIPS |
+|---|---:|---:|---:|---:|
+| All 512 validation photographs | 0.131718 | **0.120092** | 0.324860 | **0.275880** |
+| Original 64 validation photographs | 0.128089 | **0.118100** | 0.335584 | **0.286794** |
+
+LPIPS improved by **15.1%** on the expanded validation set. These are validation
+results, not an independent test or a guarantee that every example improves.
+The illustrated photographs are the same four shown for v0.1.
 [Model card, training details, limitations, and licensing](MODEL_CARD.md).
 
 This is **not an official Meta decoder**, general-purpose inpainting, or the
@@ -67,60 +76,51 @@ device when needed. Inference loads the frozen context encoder and predictor,
 but **no target encoder**. It also saves the native RGB crop and a 224x224
 composite beside the comparison grid.
 
+If v0.1 already occupies `artifacts/checkpoints/native`, download v0.2 into a
+new directory with `ijepa-decoder download --out-dir artifacts/checkpoints/native-v0.2`
+and pass `--decoder artifacts/checkpoints/native-v0.2` to inference. The
+[v0.1.0 release](https://github.com/yaskovdev/ijepa-decoder/releases/tag/v0.1.0)
+is preserved and can still be downloaded explicitly with `--version v0.1.0`.
+
 ## Reproduce Training
 
-The shipped [manifest](ijepa_decoder/manifest.json) records the exact 2,048
-training and 64 validation photographs, preprocessed-pixel hashes, and masks
-used by this model. It contains no dataset images. Preparation rejects changed
-pixels or train/validation overlap and verifies hidden-pixel isolation.
+The shipped [reference manifest](ijepa_decoder/manifest.json) preserves the
+original v0.1 photographs and masks. The v0.2 generator expands it deterministically
+to **9,469 training photographs, 37,876 masks, and 512 validation photographs**.
+The [exact expanded manifest](https://github.com/yaskovdev/ijepa-decoder/releases/download/v0.2.0/manifest.json)
+is also a release asset. Neither manifest contains dataset images. Preparation
+rejects changed pixels or train/validation overlap and verifies hidden-pixel isolation.
 
 ```shell
 pip install -c constraints.txt -e '.[train]'
 mkdir -p artifacts/data
 curl --fail --location --continue-at - --output artifacts/data/imagenette2-320.tgz https://s3.amazonaws.com/fast-ai-imageclas/imagenette2-320.tgz
 tar -xzf artifacts/data/imagenette2-320.tgz -C artifacts/data
-ijepa-decoder prepare
 ijepa-decoder assets
-ijepa-decoder train --feature-source target --steps 1000 --out-dir artifacts/target_1000
-ijepa-decoder train --feature-source mixed --steps 800 --learning-rate 5e-5 --init artifacts/target_1000/best.pt --out-dir artifacts/mixed_800
-ijepa-decoder evaluate
+ijepa-decoder download --version v0.1.0 --out-dir artifacts/checkpoints/v0.1.0
+ijepa-decoder manifest --output artifacts/scaled/manifest.json
+ijepa-decoder prepare --manifest artifacts/scaled/manifest.json --out-dir artifacts/scaled/features --batch-size 8 --shard-size 128
+ijepa-decoder train --feature-source mixed --cache-dir artifacts/scaled/features \
+  --init artifacts/checkpoints/v0.1.0 --out-dir artifacts/scaled/mixed \
+  --steps 15000 --batch-size 16 --learning-rate 5e-5 --schedule cosine \
+  --min-learning-rate 1e-6 --ema-decay 0.999 --eval-every 250
+ijepa-decoder evaluate --cache artifacts/scaled/features/val.pt
+ijepa-decoder compare --decoder artifacts/scaled/mixed/best.pt --output artifacts/scaled/comparison.png
 ```
 
 `evaluate` defaults to the released model; use
-`--decoder artifacts/mixed_800/best.pt` to evaluate a retrained checkpoint.
+`--decoder artifacts/scaled/mixed/best.pt` to evaluate a retrained checkpoint.
 Training uses original native RGB crops, L1 + 0.5 frozen AlexNet LPIPS,
 and fixed ImageNet normalization, not unknown hidden-patch statistics.
-The target stage is only a training oracle; mixed batches retain reconstruction
-ability while adapting to predictor tokens. All I-JEPA models remain frozen.
+Mixed batches alternate target/predictor examples 50/50; selection always uses
+predictor validation. All I-JEPA models remain frozen.
 
-The measured training loops took 118 + 95 seconds on an M3 Max **after feature
-caching**, excluding downloads and frozen I-JEPA extraction. Exact bitwise
+The mixed-training loop took **3,452 seconds on an M3 Max after feature caching**;
+the comparable predictor-only run took 3,374 seconds. Frozen feature extraction
+took approximately 47 minutes before consolidation. Exact bitwise
 retraining is not promised across hardware or package versions. Use new output
 directories for repeat experiments; `--init` loads weights, not optimizer state.
 Datasets, features, weights, and generated results stay under ignored `artifacts/`.
-
-### Scaled Training (Experimental)
-
-This opt-in experiment keeps the released `v0.1.0` model unchanged. It uses all
-9,469 distinct Imagenette training photographs, four masks per photograph,
-and 512 fixed validation photographs. The original 64 validation examples and
-existing training masks are preserved. Expanded training is not yet a claim of
-better reconstruction quality.
-
-After the setup above:
-
-```shell
-ijepa-decoder manifest --output artifacts/scaled/manifest.json
-ijepa-decoder prepare --manifest artifacts/scaled/manifest.json --out-dir artifacts/scaled/features --batch-size 8 --shard-size 128
-for source in predictor mixed; do
-  ijepa-decoder train --feature-source "$source" --cache-dir artifacts/scaled/features \
-    --init artifacts/checkpoints/native --out-dir "artifacts/scaled/$source" \
-    --steps 15000 --batch-size 16 --learning-rate 5e-5 --schedule cosine \
-    --min-learning-rate 1e-6 --ema-decay 0.999 --eval-every 250
-done
-ijepa-decoder compare --decoder artifacts/scaled/predictor/best.pt --output artifacts/scaled/predictor_comparison.png
-ijepa-decoder compare --decoder artifacts/scaled/mixed/best.pt --output artifacts/scaled/mixed_comparison.png
-```
 
 Preparation processes bounded shards, reuses each target-encoder pass across
 its photograph's masks, and consolidates memory-mappable caches after freeing
@@ -133,12 +133,32 @@ contains the selected decoder; `last.pt` also stores optimizer, cosine schedule,
 EMA, and random states. Resume in the same output directory with the original
 arguments, replacing `--init ...` with `--resume .../last.pt`. `--stop-after`
 pauses at an absolute step without shortening the full `--steps` schedule.
-Constant learning rate and no EMA remain the defaults for the published recipe.
+Constant learning rate and no EMA remain the CLI defaults for v0.1 reproduction;
+the v0.2 commands above enable cosine decay and EMA explicitly.
 Comparisons use identical predictor features for both models, include wrong-photo
 and shuffled-token controls, and report paired bootstrap intervals grouped by
-original photograph. The target-encoder control is explicitly separate from the
-predictor-only visualization. Use the original small validation cache with
-`compare --cache artifacts/features/val.pt` for the fixed 64-image comparison.
+original photograph. These intervals do not account for checkpoint selection on
+the same validation set. The target-encoder control is explicitly separate from
+the predictor-only visualization.
+
+To reproduce the predictor-only comparison, repeat the 15,000-step command with
+`--feature-source predictor --out-dir artifacts/scaled/predictor`. It uses the
+same initializer, data, seed, schedule, and EMA settings; its best checkpoint was
+EMA step 6,250. Mixed training performed slightly better.
+
+To reproduce the v0.1 initializer from the MAE prior, use `ijepa-decoder prepare`
+with the packaged reference manifest, then train 1,000 target-token steps followed
+by 800 mixed steps at learning rate 5e-5:
+
+```shell
+ijepa-decoder prepare
+ijepa-decoder train --feature-source target --steps 1000 --out-dir artifacts/target_1000
+ijepa-decoder train --feature-source mixed --steps 800 --learning-rate 5e-5 --init artifacts/target_1000/best.pt --out-dir artifacts/mixed_800
+```
+
+Predictor validation selected mixed step 400. Its original training loops took
+118 + 95 seconds after feature caching. Use `compare --cache artifacts/features/val.pt`
+for the fixed 64-image comparison against the preserved v0.1 release.
 
 ## Tests and Attribution
 

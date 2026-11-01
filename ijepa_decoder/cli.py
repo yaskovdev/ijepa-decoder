@@ -21,6 +21,10 @@ PACKAGE = Path(__file__).parent
 
 def download(args):
     manifest = json.loads((PACKAGE / "pretrained.json").read_text())
+    if args.version is not None and args.version != manifest["version"]:
+        manifest = json.loads((PACKAGE / f"pretrained-{args.version}.json").read_text())
+    if args.version is not None and args.version != manifest["version"]:
+        raise ValueError("Requested release differs from the pinned download manifest.")
     for name, asset in manifest["files"].items():
         path = download_file(asset["url"], Path(args.out_dir) / name, asset["sha256"])
         print(f"Verified {path}", flush=True)
@@ -151,6 +155,8 @@ def parser():
     commands = result.add_subparsers(dest="command", required=True)
     command = commands.add_parser("download", parents=[common])
     command.add_argument("--out-dir", default="artifacts/checkpoints/native")
+    command.add_argument("--version", choices=("v0.1.0", "v0.2.0"),
+                         help="Pinned model release; defaults to the latest packaged release.")
     commands.add_parser("assets", parents=[common])
     command = commands.add_parser("decode", parents=[common])
     command.add_argument("--image", required=True)
@@ -197,7 +203,7 @@ def parser():
     command = commands.add_parser("compare", parents=[common])
     command.add_argument("--cache", default="artifacts/scaled/features/val.pt")
     command.add_argument("--decoder", required=True)
-    command.add_argument("--baseline", default="artifacts/checkpoints/native")
+    command.add_argument("--baseline", default="artifacts/checkpoints/v0.1.0")
     command.add_argument("--batch-size", type=int, default=8)
     command.add_argument("--num-images", type=int, default=8)
     command.add_argument("--output", default="artifacts/scaled/comparison.png")

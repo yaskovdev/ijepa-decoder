@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ijepa-decoder"
-version = "0.1.0"
+version = "0.2.0"
 description = "Unofficial native I-JEPA predictor-to-RGB decoder"
 requires-python = ">=3.11"
 license = {file = "LICENSE"}
@@ -32,4 +32,4 @@ Repository = "https://github.com/yaskovdev/ijepa-decoder"
 include = ["ijepa_decoder*"]
 
 [tool.setuptools.package-data]
-ijepa_decoder = ["manifest.json", "pretrained.json"]
+ijepa_decoder = ["manifest.json", "pretrained*.json"]

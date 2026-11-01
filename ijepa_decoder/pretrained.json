@@ -1,18 +1,18 @@
 {
-  "version": "v0.1.0",
+  "version": "v0.2.0",
   "files": {
     "model.safetensors": {
-      "url": "https://github.com/yaskovdev/ijepa-decoder/releases/download/v0.1.0/model.safetensors",
-      "sha256": "1861705253ad1384d676f04d21f3a5640aafdd29f3e4a464b19d979da0179320",
-      "size_bytes": 105255160
+      "url": "https://github.com/yaskovdev/ijepa-decoder/releases/download/v0.2.0/model.safetensors",
+      "sha256": "c67dd5f6d513a97ea99891434b9072f6ad75cd4e08a3dca4e5369f2f1434f4af",
+      "size_bytes": 105255192
     },
     "config.json": {
-      "url": "https://github.com/yaskovdev/ijepa-decoder/releases/download/v0.1.0/config.json",
-      "sha256": "5e6aa5272f80ac244e6c3104da0d1fb4d1f289df8d664b58998f160fc38bde5d",
-      "size_bytes": 3842
+      "url": "https://github.com/yaskovdev/ijepa-decoder/releases/download/v0.2.0/config.json",
+      "sha256": "a63640cd92e0a76c081f18f2fc233c62409f5ff7f2836cf33e075bd8acdd80c7",
+      "size_bytes": 5130
     },
     "MODEL-LICENSE.txt": {
-      "url": "https://github.com/yaskovdev/ijepa-decoder/releases/download/v0.1.0/MODEL-LICENSE.txt",
+      "url": "https://github.com/yaskovdev/ijepa-decoder/releases/download/v0.2.0/MODEL-LICENSE.txt",
       "sha256": "336255dc30193e8e15d689d9481bb05673d89055718f3a96923a7ffb99adbbaf",
       "size_bytes": 19333
     }
