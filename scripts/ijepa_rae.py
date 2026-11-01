@@ -208,6 +208,10 @@ def metrics(model, cache, source, device, batch_size=16):
 def train(args):
     if args.ridge_alpha <= 0 or not math.isfinite(args.ridge_alpha):
         raise ValueError("Ridge alpha must be finite and positive.")
+    if args.hidden_dim < 0 or min(args.steps, args.batch_size) <= 0:
+        raise ValueError("Hidden dimension must be nonnegative; training steps and batch size must be positive.")
+    if args.learning_rate <= 0 or not math.isfinite(args.learning_rate):
+        raise ValueError("Learning rate must be finite and positive.")
     device = configure(args)
     training = load_spatial_cache(Path(args.cache_dir) / "train.pt")
     validation = load_spatial_cache(Path(args.cache_dir) / "val.pt")
@@ -220,7 +224,7 @@ def train(args):
     if (output / "best.pt").exists() or (output / "last.pt").exists():
         raise FileExistsError("Adapter checkpoints already exist; use a new experiment directory.")
     inputs = training[f"{args.feature_source}_tokens"]
-    model = SpatialAdapter(inputs.shape[-1], 768)
+    model = SpatialAdapter(inputs.shape[-1], 768, args.hidden_dim, args.normalize_output)
     model.fit_statistics(inputs, training["dino_tokens"], training["spatial_shape"])
     baseline = metrics(model.to(device), validation, args.feature_source, device)
     model.cpu()
@@ -229,19 +233,54 @@ def train(args):
     result = metrics(model.to(device), validation, args.feature_source, device)
     if not all(math.isfinite(value) for value in result.values()):
         raise FloatingPointError("Spatial validation metrics are not finite.")
-    payload = dict(
-        state_dict={name: value.cpu() for name, value in model.state_dict().items()},
-        input_spec=spatial_spec(training), feature_source=args.feature_source,
-        input_dim=inputs.shape[-1], output_dim=768, hidden_dim=0, ridge_alpha=args.ridge_alpha,
-        training_examples=len(inputs), validation_examples=len(validation["features"]),
-        baseline=baseline, validation=result, seed=args.seed,
-    )
-    save_cache(payload, output / "last.pt")
-    (output / "metrics.json").write_text(json.dumps(dict(baseline=baseline, validation=result), indent=2) + "\n")
-    if result["mse"] >= baseline["mse"]:
-        raise RuntimeError("Spatial ridge did not improve the mean-token baseline; inspect last.pt.")
-    save_cache(payload, output / "best.pt")
-    print(f"{args.feature_source} ridge: baseline {baseline}; validation {result}; "
+    initial = result
+    best, best_step, step = None, None, 0
+    history = [dict(step=0, validation=initial)]
+
+    def snapshot(value, training_step):
+        return dict(
+            state_dict={name: tensor.cpu() for name, tensor in model.state_dict().items()},
+            input_spec=spatial_spec(training), feature_source=args.feature_source,
+            input_dim=inputs.shape[-1], output_dim=768, hidden_dim=args.hidden_dim,
+            normalize_output=args.normalize_output, ridge_alpha=args.ridge_alpha,
+            learning_rate=args.learning_rate, training_step=training_step,
+            training_examples=len(inputs), validation_examples=len(validation["features"]),
+            baseline=baseline, ridge_initial=initial, validation=value, seed=args.seed,
+        )
+
+    if result["mse"] < baseline["mse"]:
+        best, best_step = result, 0
+        save_cache(snapshot(best, best_step), output / "best.pt")
+    if model.residual is not None:
+        model.net.requires_grad_(False)
+        optimizer = th.optim.AdamW(model.residual.parameters(), lr=args.learning_rate, weight_decay=1e-3)
+        for step in range(1, args.steps + 1):
+            indices = th.randint(len(inputs), (args.batch_size,))
+            x = inputs[indices].float().to(device)
+            y = training["dino_tokens"][indices].float().to(device)
+            predicted = model(x, training["spatial_shape"])
+            loss = ((predicted - y) / model.output_scale).square().mean()
+            if not th.isfinite(loss):
+                raise FloatingPointError(f"Spatial adapter loss is not finite at step {step}.")
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            if step % 100 == 0 or step == args.steps:
+                result = metrics(model, validation, args.feature_source, device)
+                if not all(math.isfinite(value) for value in result.values()):
+                    raise FloatingPointError(f"Spatial validation metrics are not finite at step {step}.")
+                history.append(dict(step=step, loss=loss.item(), validation=result))
+                if result["mse"] < (baseline["mse"] if best is None else best["mse"]):
+                    best, best_step = result, step
+                    save_cache(snapshot(best, best_step), output / "best.pt")
+                print(f"{args.feature_source} residual {step}/{args.steps}: {result}", flush=True)
+    save_cache(snapshot(result, step), output / "last.pt")
+    (output / "metrics.json").write_text(json.dumps(
+        dict(baseline=baseline, ridge_initial=initial, validation=best, best_step=best_step, history=history),
+        indent=2) + "\n")
+    if best is None:
+        raise RuntimeError("Spatial adapter did not improve the mean-token baseline; inspect last.pt.")
+    print(f"{args.feature_source}: baseline {baseline}; ridge {initial}; best {best} at step {best_step}; "
           f"elapsed {time.monotonic() - started:.1f}s. Saved {output / 'best.pt'}", flush=True)
 
 
@@ -251,7 +290,8 @@ def restore_adapter(path, cache, device):
         raise ValueError("Spatial adapter checkpoint differs from the frozen model, normalization, or geometry.")
     if checkpoint["feature_source"] not in ("predictor", "target"):
         raise ValueError("Invalid spatial adapter feature source.")
-    model = SpatialAdapter(checkpoint["input_dim"], checkpoint["output_dim"], checkpoint["hidden_dim"])
+    model = SpatialAdapter(checkpoint["input_dim"], checkpoint["output_dim"], checkpoint["hidden_dim"],
+                           checkpoint.get("normalize_output", False))
     model.load_state_dict(checkpoint["state_dict"], strict=True)
     return model.eval().requires_grad_(False).to(device), checkpoint["feature_source"]
 
@@ -334,6 +374,11 @@ def parser():
     command.add_argument("--out-dir", required=True)
     command.add_argument("--feature-source", choices=("predictor", "target"), default="predictor")
     command.add_argument("--ridge-alpha", type=float, default=0.1)
+    command.add_argument("--hidden-dim", type=int, default=0)
+    command.add_argument("--normalize-output", action="store_true")
+    command.add_argument("--steps", type=int, default=800)
+    command.add_argument("--batch-size", type=int, default=32)
+    command.add_argument("--learning-rate", type=float, default=3e-4)
     return result
 
 

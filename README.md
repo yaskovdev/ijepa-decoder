@@ -225,6 +225,107 @@ mapping did not resolve these failures. The second predictor sample sometimes
 changed the hypothesis substantially, so both samples also have in-context
 columns. These observations are qualitative, not reconstruction scores.
 
+### Spatial RAE Pilot on MPS
+
+This alternative keeps the individual I-JEPA target-patch predictions and maps
+their rectangular grid to the released DINOv2-with-registers RAE decoder's
+16x16x768 token grid. Both backbones and the 415-million-parameter decoder stay
+frozen. This is a deterministic crop reconstruction experiment, not Meta's
+RCDM decoder or a spatially conditioned inpainting model.
+
+```shell
+.venv/bin/python -m pip install -e '.[rae]'
+git clone https://github.com/bytetriper/RAE.git artifacts/rae
+git -C artifacts/rae checkout --detach a4d18c4db766419cbe7cb8c02cd9f7ceb0ec9041
+.venv/bin/python -m scripts.ijepa_rae assets
+.venv/bin/python -m scripts.ijepa_rae oracle --device mps --cache artifacts/ijepa_features_320_m3/val.pt --num-images 8 --output artifacts/ijepa_rae/oracle.png
+
+.venv/bin/python -m scripts.ijepa_rae prepare --device mps --train-limit 2048 --val-limit 64
+.venv/bin/python -m scripts.ijepa_rae train --device mps --feature-source predictor --out-dir artifacts/ijepa_rae/predictor_ridge
+.venv/bin/python -m scripts.ijepa_rae train --device mps --feature-source target --out-dir artifacts/ijepa_rae/target_ridge
+.venv/bin/python -m scripts.ijepa_rae sample --device mps --cache artifacts/ijepa_rae/features/val.pt --adapter artifacts/ijepa_rae/predictor_ridge/best.pt --target-adapter artifacts/ijepa_rae/target_ridge/best.pt --num-images 8 --output artifacts/ijepa_rae/comparison.png
+```
+
+The matched nonlinear experiment adds a 256-channel GELU residual, initially
+zero, to the fitted ridge projection. Only this small residual is optimized;
+the ridge and both image backbones remain frozen. `--normalize-output` is an
+explicit, checkpointed per-token LayerNorm ablation, not a change to old adapters:
+
+```shell
+.venv/bin/python -m scripts.ijepa_rae train --device mps --feature-source predictor --hidden-dim 256 --steps 800 --out-dir artifacts/ijepa_rae/predictor_mlp256
+.venv/bin/python -m scripts.ijepa_rae train --device mps --feature-source target --hidden-dim 256 --steps 800 --out-dir artifacts/ijepa_rae/target_mlp256
+.venv/bin/python -m scripts.ijepa_rae sample --device mps --cache artifacts/ijepa_rae/features/val.pt --adapter artifacts/ijepa_rae/predictor_mlp256/best.pt --target-adapter artifacts/ijepa_rae/target_mlp256/best.pt --num-images 8 --output artifacts/ijepa_rae/comparison_mlp256.png
+
+.venv/bin/python -m scripts.ijepa_rae train --device mps --feature-source predictor --hidden-dim 256 --normalize-output --steps 800 --out-dir artifacts/ijepa_rae/predictor_mlp256_ln
+.venv/bin/python -m scripts.ijepa_rae train --device mps --feature-source target --hidden-dim 256 --normalize-output --steps 800 --out-dir artifacts/ijepa_rae/target_mlp256_ln
+.venv/bin/python -m scripts.ijepa_rae sample --device mps --cache artifacts/ijepa_rae/features/val.pt --adapter artifacts/ijepa_rae/predictor_mlp256_ln/best.pt --target-adapter artifacts/ijepa_rae/target_mlp256_ln/best.pt --num-images 8 --output artifacts/ijepa_rae/comparison_mlp256_ln.png
+```
+
+The asset command pins both Hugging Face revisions and checks the decoder's
+SHA-256. DINOv2 uses ImageNet-normalized RGB in [0,1], excludes CLS and four
+register tokens, and removes the final LayerNorm affine parameters as required
+by the released RAE checkpoint. Its signed patch features must not be pooled,
+L2-normalized, or passed through the old ResNet adapter's ReLU. No Stage 2 DiT
+model or diffusion sampler is loaded.
+
+On PyTorch 2.7 MPS, antialiased positional interpolation is unavailable. The
+encoder therefore precomputes the exact upstream 224-pixel positional
+interpolation on CPU before moving to MPS; it does not enable global CPU
+fallback. The true-DINO oracle reconstructed eight held-out hidden crops with
+RGB MAE 0.047 on [0,1] pixels; encoder-plus-decoder inference took 1.9 seconds,
+excluding model loading. These are ground-truth-conditioned controls, not
+predictor results.
+
+Preparation selects distinct original photographs from the existing expanded
+caches, preserves their boxes and pixel hashes, and verifies that changing
+hidden pixels leaves the real predictor's unpooled tokens unchanged. Both
+spatial adapters use training-only statistics and a streamed float64 ridge
+solve on CPU. Cache storage is float16; inference is float32 on MPS. Extracting
+2,048 training and 64 validation examples took 269 seconds. The matched
+800-step residual fits took about 22 seconds each while running together.
+
+The comparison labels **DINOv2 oracle** and **IJEPA target** identify controls
+that see hidden RGB. **Via target** instead feeds predictor tokens through the
+target-trained adapter. The primary **predictor** and its in-context composite
+use only predictor tokens. **Wrong predictor** changes the source photograph;
+**shuffled tokens** keeps the same token mean but changes their spatial order.
+
+On all 64 validation photographs, with feature MSE standardized by the
+training-only DINO channel scales:
+
+| Source and adapter | Feature MSE | Token cosine | Wrong-photo MSE |
+|---|---:|---:|---:|
+| Predictor, mean tokens (no output LayerNorm) | 0.993 | 0.467 | 0.993 |
+| Predictor, ridge | 0.821 | 0.614 | 1.218 |
+| Predictor, residual MLP | 0.800 | 0.627 | 1.239 |
+| True I-JEPA target, residual MLP | 0.771 | 0.645 | 1.291 |
+| Predictor, residual MLP + output LayerNorm | 0.838 | 0.590 | 1.316 |
+| True I-JEPA target, residual MLP + output LayerNorm | 0.808 | 0.615 | 1.386 |
+
+The first eight validation images gave predictor RGB MAE 0.165 for ridge,
+0.163 for the residual, and 0.152 for the normalized residual; the corresponding
+true-I-JEPA-target control reached 0.137 and the true-DINO oracle 0.047.
+These pixel errors are diagnostics on eight examples, not semantic-quality
+scores or proof that predictor uncertainty has been resolved. Output
+normalization helped RGB error here despite worse feature metrics.
+`artifacts/ijepa_rae/results.json` records these measurements and controls.
+
+**Outcome:** native DINO tokens reconstruct detailed crops, but mapped I-JEPA
+tokens still produce blurred shapes and colors, often with grid texture.
+The headset outline and broad background layout are partially retained;
+truck details, the chainsaw, and fine structure are not recovered reliably.
+Even the adapter fed true target-encoder tokens remains blurry, so the
+cross-encoder/spatial bridge is already a bottleneck before predictor
+uncertainty is considered. The residual and output normalization did not
+establish a qualitative improvement over the earlier DINO-RCDM route.
+Wrong-image and shuffled-token controls visibly alter the result; all three
+comparisons preserve visible pixels exactly outside the mask.
+
+The next useful experiment is a learned spatial upsampler with decoder-aware
+RGB/perceptual supervision rather than more latent-only regression. The pilot
+does not require rented GPUs; its current limitation is reconstruction
+quality, not Mac inference speed.
+
 ## Sample Using PyCharm on macOS with Remote Linux Interpreter
 
 ```shell

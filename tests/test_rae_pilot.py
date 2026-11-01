@@ -41,6 +41,38 @@ class RaePilotTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "positive"):
             model.fit_ridge(inputs, targets, (2, 3), alpha=float("nan"))
 
+    def test_spatial_residual_starts_at_the_fitted_ridge_and_receives_gradients(self):
+        inputs = th.randn(8, 4, 3)
+        targets = regrid(inputs, (2, 2)) @ th.randn(3, 4)
+        linear, residual = SpatialAdapter(3, 4), SpatialAdapter(3, 4, hidden_dim=5)
+        for model in (linear, residual):
+            model.fit_ridge(inputs, targets, (2, 2), alpha=0.1)
+        th.testing.assert_close(residual(inputs, (2, 2)), linear(inputs, (2, 2)), rtol=0, atol=0)
+        residual.net.requires_grad_(False)
+        loss = (residual(inputs, (2, 2)) - targets).square().mean()
+        loss.backward()
+        self.assertGreater(residual.residual[-1].weight.grad.abs().sum().item(), 0)
+        self.assertIsNone(residual.net[0].weight.grad)
+
+    def test_spatial_output_normalization_is_explicit_and_restored(self):
+        model = SpatialAdapter(3, 768, hidden_dim=5, normalize_output=True)
+        with th.no_grad():
+            model.net[0].weight.normal_()
+        features = th.randn(2, 4, 3)
+        expected = model(features, (2, 2))
+        th.testing.assert_close(expected.mean(-1), th.zeros(2, 256), atol=1e-6, rtol=0)
+        th.testing.assert_close(expected.var(-1, unbiased=False), th.ones(2, 256), atol=2e-5, rtol=0)
+        cache = dict(features=th.zeros(2, 3), conditioning="ijepa_predictor", input_size=224,
+                     patch_size=14, block_size=7, ijepa_epoch=299, ijepa_checkpoint="frozen.pt",
+                     spatial_shape=[2, 2], target_normalization="layer_norm_patch_tokens", rae_spec=rae_spec())
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "adapter.pt"
+            th.save(dict(state_dict=model.state_dict(), input_spec=spatial_spec(cache),
+                         input_dim=3, output_dim=768, hidden_dim=5, normalize_output=True,
+                         feature_source="predictor"), path)
+            restored, _ = restore_adapter(path, cache, "cpu")
+            th.testing.assert_close(restored(features, (2, 2)), expected, rtol=0, atol=0)
+
     @unittest.skipUnless(importlib.util.find_spec("transformers"), "RAE optional dependencies are absent")
     def test_cpu_position_cache_matches_unmodified_dino_forward(self):
         from transformers import Dinov2WithRegistersConfig, Dinov2WithRegistersModel

@@ -151,7 +151,7 @@ def regrid(tokens, source_shape, output_size=16):
 
 
 class SpatialAdapter(nn.Module):
-    def __init__(self, input_dim=1280, output_dim=768, hidden_dim=0):
+    def __init__(self, input_dim=1280, output_dim=768, hidden_dim=0, normalize_output=False):
         super().__init__()
         if min(input_dim, output_dim) <= 0 or hidden_dim < 0:
             raise ValueError("Spatial adapter dimensions must be positive.")
@@ -159,17 +159,26 @@ class SpatialAdapter(nn.Module):
         self.register_buffer("input_scale", th.ones(input_dim))
         self.register_buffer("output_mean", th.zeros(output_dim))
         self.register_buffer("output_scale", th.ones(output_dim))
-        self.net = nn.Sequential(nn.Linear(input_dim, output_dim)) if hidden_dim == 0 else nn.Sequential(
+        self.normalize_output = normalize_output
+        self.net = nn.Sequential(nn.Linear(input_dim, output_dim))
+        self.residual = None if hidden_dim == 0 else nn.Sequential(
             nn.Linear(input_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, output_dim),
         )
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
+        if self.residual is not None:
+            nn.init.zeros_(self.residual[-1].weight)
+            nn.init.zeros_(self.residual[-1].bias)
 
     def forward(self, tokens, source_shape):
         if tokens.shape[-1] != self.input_mean.numel():
             raise ValueError("Spatial adapter input feature dimension does not match training.")
-        projected = self.net((tokens - self.input_mean) / self.input_scale)
-        return self.output_mean + self.output_scale * regrid(projected, source_shape)
+        standardized = (tokens - self.input_mean) / self.input_scale
+        projected = self.net(standardized)
+        if self.residual is not None:
+            projected = projected + self.residual(standardized)
+        output = self.output_mean + self.output_scale * regrid(projected, source_shape)
+        return F.layer_norm(output, (output.shape[-1],), eps=1e-6) if self.normalize_output else output
 
     @th.no_grad()
     def fit_statistics(self, inputs, targets, source_shape, batch_size=16):
