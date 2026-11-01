@@ -99,6 +99,40 @@ retraining is not promised across hardware or package versions. Use new output
 directories for repeat experiments; `--init` loads weights, not optimizer state.
 Datasets, features, weights, and generated results stay under ignored `artifacts/`.
 
+### Scaled Training (Experimental)
+
+This opt-in experiment keeps the released `v0.1.0` model unchanged. It uses all
+9,469 distinct Imagenette training photographs, four masks per photograph,
+and 512 fixed validation photographs. The original 64 validation examples and
+existing training masks are preserved. Expanded training is not yet a claim of
+better reconstruction quality.
+
+After the setup above:
+
+```shell
+ijepa-decoder manifest --output artifacts/scaled/manifest.json
+ijepa-decoder prepare --manifest artifacts/scaled/manifest.json --out-dir artifacts/scaled/features --batch-size 8 --shard-size 128
+for source in predictor mixed; do
+  ijepa-decoder train --feature-source "$source" --cache-dir artifacts/scaled/features \
+    --init artifacts/checkpoints/native --out-dir "artifacts/scaled/$source" \
+    --steps 15000 --batch-size 16 --learning-rate 5e-5 --schedule cosine \
+    --min-learning-rate 1e-6 --ema-decay 0.999 --eval-every 250
+done
+```
+
+Preparation processes bounded shards, reuses each target-encoder pass across
+its photograph's masks, and consolidates memory-mappable caches after freeing
+the frozen networks. Originals are stored once; final caches occupy about
+11 GB. Temporary shards need another approximately 11 GB during preparation.
+Repeat the preparation command with `--resume` after interruption.
+
+Training compares raw and EMA weights on the same validation data. `best.pt`
+contains the selected decoder; `last.pt` also stores optimizer, cosine schedule,
+EMA, and random states. Resume in the same output directory with the original
+arguments, replacing `--init ...` with `--resume .../last.pt`. `--stop-after`
+pauses at an absolute step without shortening the full `--steps` schedule.
+Constant learning rate and no EMA remain the defaults for the published recipe.
+
 ## Tests and Attribution
 
 ```shell

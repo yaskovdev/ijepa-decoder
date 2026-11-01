@@ -5,7 +5,7 @@ from pathlib import Path
 import torch as th
 from PIL import ImageDraw
 
-from .data import prepare
+from .data import generate_manifest, prepare
 from .encoder import IJEPA_CHECKPOINT, load_ijepa, make_masks, predict_tokens
 from .io import (
     as_image, compose, configure, download_file, image_pixels, normalized, rgb_pixels, save_cache, save_grid,
@@ -88,12 +88,21 @@ def parser():
     command.add_argument("--left", type=int, default=4)
     command.add_argument("--decoder", default="artifacts/checkpoints/native")
     command.add_argument("--output", default="artifacts/prediction.png")
+    command = commands.add_parser("manifest", parents=[common])
+    command.add_argument("--data-dir", default="artifacts/data/imagenette2-320")
+    command.add_argument("--reference-manifest", default=str(PACKAGE / "manifest.json"))
+    command.add_argument("--masks-per-image", type=int, default=4)
+    command.add_argument("--validation-images", type=int, default=512)
+    command.add_argument("--output", default="artifacts/scaled/manifest.json")
     command = commands.add_parser("prepare", parents=[common])
     command.add_argument("--manifest", default=str(PACKAGE / "manifest.json"))
     command.add_argument("--data-dir", default="artifacts/data/imagenette2-320")
     command.add_argument("--out-dir", default="artifacts/features")
     command.add_argument("--batch-size", type=int, default=4)
     command.add_argument("--limit", type=int)
+    command.add_argument("--shard-size", type=int, default=0,
+                         help="Photographs per resumable preparation shard; zero keeps the small-cache recipe.")
+    command.add_argument("--resume", action="store_true")
     command = commands.add_parser("train", parents=[common])
     command.add_argument("--cache-dir", default="artifacts/features")
     command.add_argument("--out-dir", required=True)
@@ -102,11 +111,19 @@ def parser():
     command.add_argument("--batch-size", type=int, default=8)
     command.add_argument("--learning-rate", type=float, default=1e-4)
     command.add_argument("--lpips-weight", type=float, default=0.5)
-    command.add_argument("--init")
+    command.add_argument("--schedule", choices=("constant", "cosine"), default="constant")
+    command.add_argument("--min-learning-rate", type=float, default=0)
+    command.add_argument("--ema-decay", type=float, default=0)
+    command.add_argument("--eval-every", type=int, default=100)
+    command.add_argument("--stop-after", type=int, help="Pause at this absolute step without shortening --steps.")
+    initialization = command.add_mutually_exclusive_group()
+    initialization.add_argument("--init")
+    initialization.add_argument("--resume", help="Restore weights, optimizer, schedule, EMA, and RNG from last.pt.")
     command = commands.add_parser("evaluate", parents=[common])
     command.add_argument("--cache", default="artifacts/features/val.pt")
     command.add_argument("--decoder", default="artifacts/checkpoints/native")
     command.add_argument("--batch-size", type=int, default=8)
+    command.add_argument("--output", help="Save metrics and paired per-example errors as JSON.")
     return result
 
 
@@ -117,7 +134,8 @@ def main():
 
         {"train": train, "evaluate": evaluate}[args.command](args)
     else:
-        {"download": download, "assets": assets, "decode": decode, "prepare": prepare}[args.command](args)
+        {"download": download, "assets": assets, "decode": decode, "manifest": generate_manifest,
+         "prepare": prepare}[args.command](args)
 
 
 if __name__ == "__main__":

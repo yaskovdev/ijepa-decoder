@@ -1,4 +1,5 @@
 import hashlib
+import json
 from pathlib import Path
 from urllib.request import urlopen
 
@@ -53,6 +54,14 @@ def save_cache(data, path):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     th.save(data, temporary)
+    temporary.replace(path)
+
+
+def save_json(data, path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(data, indent=2) + "\n")
     temporary.replace(path)
 
 

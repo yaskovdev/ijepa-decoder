@@ -61,7 +61,14 @@ def predict_tokens(encoder, predictor, images, context, target):
 
 
 @th.no_grad()
-def target_tokens(encoder, images, target):
+def target_tokens(encoder, images, target, image_indices=None):
     tokens = encoder(images)
     tokens = th.nn.functional.layer_norm(tokens, (tokens.shape[-1],))
+    if image_indices is not None:
+        if (image_indices.dtype != th.long or image_indices.shape != (len(target),)
+                or image_indices.min() < 0 or image_indices.max() >= len(images)):
+            raise ValueError("Target masks must map to valid original images.")
+        tokens = tokens[image_indices]
+    if len(tokens) != len(target):
+        raise ValueError("Target mask and original image batches differ.")
     return tokens.gather(1, target[..., None].expand(-1, -1, tokens.shape[-1]))
