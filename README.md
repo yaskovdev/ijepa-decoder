@@ -1,675 +1,123 @@
-# An Attempt to Create a Decoder for I-JEPA
+# I-JEPA Decoder (Unofficial)
 
-An attempt to create a decoder for [I-JEPA](https://github.com/facebookresearch/ijepa) based on RCDM, work in progress.
+**Turn Meta I-JEPA predictor features into an RGB visualization.** This
+independent research prototype includes only the best native decoder,
+image inference, and the code/data manifest needed to reproduce its training.
+No RCDM, DINO, RAE, or diffusion generator is required.
 
-Models requiring `vissl` currently can't be sampled from.
+![Best native predictor checkpoint: original, context, true target, predictor, and prediction pasted into context](docs/result.png)
 
-## Small I-JEPA Predictor Decoder on Apple Silicon
+Four illustrated validation examples from the **same best predictor model**.
+The predictor sees only visible patches and known mask positions; the
+**in context** column inserts its decoded crop without changing visible pixels.
+The true target is a comparison, not an input to prediction.
 
-This pilot trains a small RCDM on **frozen official I-JEPA predictor outputs**,
-not on full-image encoder features. It is not Meta's unpublished decoder.
-The context encoder receives only visible patch tokens. The predictor receives
-the hidden block's positions, and its outputs are average-pooled into a
-1280-dimensional conditioning vector. The diffusion target is the corresponding
-RGB crop. Preparation verifies that changing hidden pixels does not change the
-conditioning.
+## Pretrained Decoder
 
-Use a separate environment. The commands below reuse an existing PyTorch 2.7.1
-installation; otherwise install the matching PyTorch/torchvision versions there.
+**[Download v0.1.0](https://github.com/yaskovdev/ijepa-decoder/releases/tag/v0.1.0)**
+or use `ijepa-decoder download` below. The release contains
+[105 MB safetensors weights](https://github.com/yaskovdev/ijepa-decoder/releases/download/v0.1.0/model.safetensors),
+[config](https://github.com/yaskovdev/ijepa-decoder/releases/download/v0.1.0/config.json),
+the model license, and
+[SHA256SUMS](https://github.com/yaskovdev/ijepa-decoder/releases/download/v0.1.0/SHA256SUMS).
+Checksums are verified by the downloader. Weights are release assets, not git blobs.
+
+The decoder has **26.3 million parameters**, is initialized from MAE-base, and
+maps 49 unpooled I-JEPA ViT-H/14 predictor tokens plus their native positions
+to a **98x98 RGB crop**. The released mixed-training checkpoint was selected
+at step **400**, not the final step 800 and not a target-encoder oracle.
+On all 64 validation photographs, RGB MAE is **0.128089**, LPIPS **0.335584**.
+[Model card, training details, limitations, and licensing](MODEL_CARD.md).
+
+This is **not an official Meta decoder**, general-purpose inpainting, or the
+unique hidden image. Colors, details, alignment, and seams may be wrong.
+Only patch-aligned 7x7 masks in the 224x224 center-cropped view are supported.
+
+## Install and Visualize Your Image
+
+Python 3.12 / PyTorch 2.7.1 was tested on Apple Silicon MPS. CUDA and CPU are
+supported code paths, but their runtime was not benchmarked. Choose appropriate
+Linux wheels using the [PyTorch installation guide](https://pytorch.org/get-started/locally/).
 
 ```shell
-python3 -m venv --system-site-packages .venv
-.venv/bin/python -m pip install -e . "torch==2.7.1" "torchvision==0.22.1"
+git clone https://github.com/yaskovdev/ijepa-decoder.git
+cd ijepa-decoder
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -c constraints.txt -e .
+ijepa-decoder download
+```
 
-mkdir -p artifacts/checkpoints artifacts/data
-git clone --depth 1 https://github.com/facebookresearch/ijepa.git artifacts/ijepa
+You also need the **full official I-JEPA encoder/predictor checkpoint**
+(about 10.4 GB), not an encoder-only Hugging Face model. I-JEPA is downloaded
+separately and retains its own noncommercial license:
+
+```shell
+mkdir -p artifacts/checkpoints
+git clone https://github.com/facebookresearch/ijepa.git artifacts/ijepa
+git -C artifacts/ijepa checkout 52c1ae95d05f743e000e8f10a1f3a79b10cff048
 curl --fail --location --continue-at - --output artifacts/checkpoints/IN1K-vit.h.14-300e.pth.tar https://dl.fbaipublicfiles.com/ijepa/IN1K-vit.h.14-300e.pth.tar
-curl --fail --location --continue-at - --output artifacts/data/imagenette2-160.tgz https://s3.amazonaws.com/fast-ai-imageclas/imagenette2-160.tgz
-tar -xzf artifacts/data/imagenette2-160.tgz -C artifacts/data
-
-.venv/bin/python -m scripts.ijepa_decoder prepare --device mps --train-limit 1000 --val-limit 64
-.venv/bin/python -m scripts.ijepa_decoder train --device mps --steps 2000
-.venv/bin/python -m scripts.ijepa_decoder sample --device mps --checkpoint artifacts/ijepa_decoder/ema_0.99_002000.pt
+ijepa-decoder decode --image your-image.jpg --top 4 --left 4 --output artifacts/prediction.png
 ```
 
-The full I-JEPA checkpoint is approximately 10.4 GB and includes the predictor;
-an encoder-only Hugging Face checkpoint is insufficient. Prepared features,
-checkpoints and grids are saved under the ignored `artifacts/` directory.
-Training and validation are cached separately. Once preparation exits, decoder
-training no longer needs I-JEPA in GPU memory.
+`--top` / `--left` are patch coordinates (0 through 9) in the **224x224
+center-cropped view**, not original-image pixel coordinates. The hidden block
+is always 7x7 patches. `--device auto` selects CUDA, MPS, or CPU; use an explicit
+device when needed. Inference loads the frozen context encoder and predictor,
+but **no target encoder**. It also saves the native RGB crop and a 224x224
+composite beside the comparison grid.
 
-The short pilot uses 64x64 targets, a 32-channel U-Net, and EMA 0.99 rather than
-the original long-run EMA 0.9999. The grid shows the original, masked context,
-true target, multiple generated samples, and a different conditioning vector
-with the same initial noise. Generalization and sensitivity to conditioning,
-not only training loss, determine whether a larger run is worthwhile.
+## Reproduce Training
 
-An optional `train --predict-xstart` selects RCDM's existing clean-image
-prediction objective instead of noise prediction. Use a separate `--out-dir`
-when comparing objectives; sampling reads the matching objective from the saved
-configuration.
-
-**Pilot limitation:** With 1,000 Imagenette training crops, the initial
-2,000-step noise-prediction run still yields strongly colored, noisy images.
-A separate 500-step clean-image run yields generic blurred patterns. Neither
-is yet a convincing visualization of I-JEPA predictions; the wrong-conditioning
-control remains visually similar. This establishes local execution, not decoder
-quality.
-
-Resume with `train --steps TOTAL_STEPS --resume-checkpoint PATH_TO_MODEL_PT`.
-Keep the matching optimizer and EMA files in the same directory. Model settings
-are recorded in `decoder_config.json` and checked before resuming.
-The standard `scripts/image_train.py` also accepts `--device mps`,
-`--feature_cache PATH`, and `--max_steps TOTAL_STEPS`.
-
-The official I-JEPA source and weights are licensed
-[CC-BY-NC 4.0](https://github.com/facebookresearch/ijepa/blob/main/LICENSE).
-Their use is restricted to noncommercial purposes.
-
-### Frozen RCDM Prior and a Small Predictor Adapter
-
-This is the more useful starting point after preparing the I-JEPA caches.
-Keep the released DINO-RCDM generator frozen, and train only a small
-`1280 -> 512 -> 2048` adapter from predictor outputs to DINO features of the
-corresponding hidden RGB crops. I-JEPA is also frozen. Learning an image prior
-from scratch is no longer necessary.
+The shipped [manifest](ijepa_decoder/manifest.json) records the exact 2,048
+training and 64 validation photographs, preprocessed-pixel hashes, and masks
+used by this model. It contains no dataset images. Preparation rejects changed
+pixels or train/validation overlap and verifies hidden-pixel isolation.
 
 ```shell
-curl --fail --location --continue-at - --output artifacts/checkpoints/dino_resnet50_pretrain.pth https://dl.fbaipublicfiles.com/dino/dino_resnet50_pretrain/dino_resnet50_pretrain.pth
-curl --fail --location --continue-at - --output artifacts/checkpoints/rcdm_ema_dino_trunk.pt https://dl.fbaipublicfiles.com/rcdm/rcdm_ema_dino_trunk.pt
-
-.venv/bin/python -m scripts.ijepa_adapter prepare --device mps
-.venv/bin/python -m scripts.ijepa_adapter sample --device mps --oracle-only --output artifacts/ijepa_adapter/oracle_baseline.png
-.venv/bin/python -m scripts.ijepa_adapter train --device mps --steps 2000
-.venv/bin/python -m scripts.ijepa_adapter sample --device mps --adapter artifacts/ijepa_adapter/best.pt
+pip install -c constraints.txt -e '.[train]'
+mkdir -p artifacts/data
+curl --fail --location --continue-at - --output artifacts/data/imagenette2-320.tgz https://s3.amazonaws.com/fast-ai-imageclas/imagenette2-320.tgz
+tar -xzf artifacts/data/imagenette2-320.tgz -C artifacts/data
+ijepa-decoder prepare
+ijepa-decoder assets
+ijepa-decoder train --feature-source target --steps 1000 --out-dir artifacts/target_1000
+ijepa-decoder train --feature-source mixed --steps 800 --learning-rate 5e-5 --init artifacts/target_1000/best.pt --out-dir artifacts/mixed_800
+ijepa-decoder evaluate
 ```
 
-The additional weights total approximately 1.8 GB. DINO targets use 224x224 RGB
-in `[-1, 1]`, **without ImageNet or L2 normalization**, matching the original
-RCDM extraction code. Crops come from the cached original images and exact hidden
-boxes, not from upsampling the low-resolution diffusion targets. Model/geometry,
-image paths, and boxes are checked when pairing caches.
+`evaluate` defaults to the released model; use
+`--decoder artifacts/mixed_800/best.pt` to evaluate a retrained checkpoint.
+Training uses original native RGB crops, L1 + 0.5 frozen AlexNet LPIPS,
+and fixed ImageNet normalization, not unknown hidden-patch statistics.
+The target stage is only a training oracle; mixed batches retain reconstruction
+ability while adapting to predictor tokens. All I-JEPA models remain frozen.
 
-Adapter normalization statistics come only from training features. `best.pt`
-is selected using validation feature error; `last.pt` is not necessarily better.
-In the initial 1,000-image run, the best recorded checkpoint was step 100 rather
-than step 2000. Its validation normalized MSE was 0.795 versus 0.961 for constant
-mean features; cosine similarity was 0.810 versus 0.641 with shuffled pairing.
+The measured training loops took 118 + 95 seconds on an M3 Max **after feature
+caching**, excluding downloads and frozen I-JEPA extraction. Exact bitwise
+retraining is not promised across hardware or package versions. Use new output
+directories for repeat experiments; `--init` loads weights, not optimizer state.
+Datasets, features, weights, and generated results stay under ignored `artifacts/`.
 
-The grid columns are original, masked context, true target, **DINO oracle**,
-predictor samples, **in context**, and wrong-predictor control. The oracle uses the true hidden
-RGB only as a decoder-quality reference. Predictor columns receive only the
-adapted predictor vector. DDIM uses identical initial noise for oracle,
-predictor sample 1, and the wrong-predictor control.
-
-The **in context** column pastes predictor sample 1 into its exact hidden
-rectangle at the original image resolution. All visible pixels remain unchanged;
-the hidden rectangle is fully replaced, without blending with its true pixels.
-This is a visualization, not a spatially conditioned inpainting model, so seams
-and inconsistent object alignment are expected. Oracle-only grids do not label
-ground-truth-conditioned generations as predictions.
-
-The initial predictor grid contains recognizable vehicle, golf-ball and dog
-hypotheses, with a less faithful audio-equipment example. This is a small
-Imagenette proof of concept, not Meta's decoder or a full ImageNet evaluation.
-Validation is withheld from adapter training, not necessarily from the
-pretrained backbones or image prior. The released
-[RCDM weights are also noncommercial](https://dl.fbaipublicfiles.com/rcdm/LICENSE).
-
-### More Data, Multiple Masks, and a Target-Encoder Control
-
-Use Imagenette 320 for the next bounded Mac experiment. The preparation command
-below uses all 9,469 training photographs and 256 validation photographs, with
-three distinct hidden-block positions per photograph: 28,407 and 768 examples.
-Split photographs before adding masks. Original images are stored only once
-and accessed through `image_indices`; DINO pairing also checks this mapping and
-the hashes of the preprocessed original pixels.
+## Tests and Attribution
 
 ```shell
-.venv/bin/python -m scripts.ijepa_decoder prepare --device mps --data-dir artifacts/data/imagenette2-320 --out-dir artifacts/ijepa_features_320_m3 --train-limit 10000 --val-limit 256 --masks-per-image 3 --with-target-encoder
-.venv/bin/python -m scripts.ijepa_adapter prepare --device mps --cache-dir artifacts/ijepa_features_320_m3 --out-dir artifacts/dino_crop_features_320_m3
-
-.venv/bin/python -m scripts.ijepa_adapter train --device mps --cache-dir artifacts/ijepa_features_320_m3 --dino-cache-dir artifacts/dino_crop_features_320_m3 --kind ridge --ridge-alpha 1 --out-dir artifacts/ijepa_adapter_320_ridge1
-.venv/bin/python -m scripts.ijepa_adapter train --device mps --cache-dir artifacts/ijepa_features_320_m3 --dino-cache-dir artifacts/dino_crop_features_320_m3 --hidden-dim 128 --dropout 0.25 --weight-decay 0.1 --lr 0.0003 --log-interval 25 --out-dir artifacts/ijepa_adapter_320_mlp128
-.venv/bin/python -m scripts.ijepa_adapter train --device mps --cache-dir artifacts/ijepa_features_320_m3 --dino-cache-dir artifacts/dino_crop_features_320_m3 --feature-source target --kind ridge --ridge-alpha 1 --out-dir artifacts/ijepa_target_adapter_320_ridge1
-
-.venv/bin/python -m scripts.ijepa_adapter sample --device mps --cache artifacts/ijepa_features_320_m3/val.pt --dino-cache artifacts/dino_crop_features_320_m3/val.pt --adapter artifacts/ijepa_adapter_320_ridge1/best.pt --target-adapter artifacts/ijepa_target_adapter_320_ridge1/best.pt --reference-adapter artifacts/ijepa_adapter/best.pt --output artifacts/ijepa_adapter_320_ridge1/comparison.png
+python -m unittest discover -s tests -v
 ```
 
-Ridge fits a regularized linear adapter using a float64 solve on CPU; inference
-and MLP training still use MPS float32. Compare ridge strengths such as 0.1, 1
-and 10, and smaller MLPs, selecting `best.pt` by held-out feature error rather
-than training duration. Sampling chooses distinct photographs by default, and
-wrong-conditioning controls use another photograph, not another mask of the
-same one.
-
-The optional **IJEPA target** column uses the actual target encoder, which sees
-hidden pixels, through a target-trained adapter. **Via target** applies that
-same adapter to predictor outputs instead. These help diagnose mapping quality
-and predictor/target mismatch; the gap can reflect information loss or
-distribution shift, not just decoder error. Neither reference is an input to
-the primary predictor adapter. Target tokens are layer-normalized individually before
-masking and pooling, as in official I-JEPA training. **Reference** uses the
-previous adapter on the same examples and boxes. All reference columns and
-predictor sample 1 share the same DDIM noise. Use `--sampling-steps 250` for a
-separate sampling-budget comparison without changing the pretrained resolution.
-
-On the expanded caches, the best ridge strength was **0.1**. The smaller
-256-hidden-unit MLP was nearly tied. The following comparisons use the same
-768 validation regions, and all errors use the same DINO normalization scales
-fitted on the expanded training data:
-
-| Decoder input / adapter | Normalized feature MSE | DINO cosine |
-| --- | ---: | ---: |
-| Predictor / original 1,000-image MLP | 0.870 | 0.769 |
-| Predictor / expanded ridge 0.1 | **0.698** | **0.823** |
-| Predictor / expanded MLP 256 | 0.701 | 0.822 |
-| Actual I-JEPA target / target ridge 0.1 (oracle) | 0.619 | 0.847 |
-| Predictor / that same target ridge 0.1 | 0.752 | 0.805 |
-
-The expanded pipeline reduces held-out **feature** error by approximately 20%
-relative to the original adapter; this is not a pixel-reconstruction score.
-Predictor and target pooled vectors have mean cosine 0.961, but even small
-representation errors can affect the decoded image. The experiment remains
-restricted to Imagenette's ten classes and does not establish a universal decoder.
-Full metrics are in `artifacts/ijepa_adapter_320_results.json`.
-
-The selected predictor and target checkpoints are
-`artifacts/ijepa_adapter_320_ridge0.1/best.pt` and
-`artifacts/ijepa_target_adapter_320_ridge0.1/best.pt`.
-Controlled grids are `artifacts/ijepa_adapter_320_ridge0.1/comparison_100.png`
-and `comparison_250.png` in the same directory. The 100-step grid includes the
-old adapter on the new examples, target controls, and the in-context column;
-the 250-step grid uses the same first two examples and initial noises.
-
-The context column exposes persistent object-scale and alignment errors,
-including dog-part crops: this is still semantic visualization, not faithful
-spatial inpainting. In the two inspected regions, 250 DDIM steps offered no
-clear semantic improvement over 100.
-
-### Four Regions from the Official I-JEPA README
-
-The official figure already contains decoded grayscale sketches inside its
-blue frames, not the original hidden RGB. The reference experiment removes
-those pixels and the frame before resizing, and excludes all intersecting
-patches from the context encoder. It never uses the supplied sketches as
-conditioning or ground-truth targets.
-
-After preparing the expanded predictor ridge 0.1, MLP 256, and target ridge 0.1
-checkpoints above:
-
-```shell
-mkdir -p artifacts/ijepa_paper_regions
-curl --fail --location --output artifacts/ijepa_paper_regions/source_figure.png https://github.com/facebookresearch/ijepa/assets/7530871/9b66e461-fc8b-4b12-9f06-63ec4dfc1452
-.venv/bin/python -m scripts.ijepa_paper_regions
-```
-
-Results are saved to `artifacts/ijepa_paper_regions/predictions.png`, with
-individual native-resolution composites and raw predictions in the same
-directory. All three adapters decode the same predictor vectors and share the
-first sampling noise. **Via target** is a target-trained adapter applied to
-predictor outputs, not an oracle. No true-hidden-RGB reference is available here.
-
-These approximately 197-pixel tiles are enlarged to 224 pixels. Their rectangles
-require 8x9 or 9x8 patch masks, versus the adapters' 7x7 training masks. The driver
-explicitly enables mask-geometry transfer while retaining frozen-model and
-normalization checks. Generated crops are mapped back into the exact original
-rectangles; every source pixel outside them is preserved. New image classes,
-thumbnail resolution, and changed mask geometry make this a transfer experiment,
-not an exact reproduction or quantitative comparison with Meta's decoder.
-
-In the four-region run, dog heads and building facades were recognizable, but
-breed and alignment varied. The bird's leg was not convincingly decoded; the
-wolf's legs remained ambiguous and poorly aligned. MLP and target-trained
-mapping did not resolve these failures. The second predictor sample sometimes
-changed the hypothesis substantially, so both samples also have in-context
-columns. These observations are qualitative, not reconstruction scores.
-
-### Spatial RAE Pilot on MPS
-
-This alternative keeps the individual I-JEPA target-patch predictions and maps
-their rectangular grid to the released DINOv2-with-registers RAE decoder's
-16x16x768 token grid. Both backbones and the 415-million-parameter decoder stay
-frozen. This is a deterministic crop reconstruction experiment, not Meta's
-RCDM decoder or a spatially conditioned inpainting model.
-
-```shell
-.venv/bin/python -m pip install -e '.[rae]'
-git clone https://github.com/bytetriper/RAE.git artifacts/rae
-git -C artifacts/rae checkout --detach a4d18c4db766419cbe7cb8c02cd9f7ceb0ec9041
-.venv/bin/python -m scripts.ijepa_rae assets
-.venv/bin/python -m scripts.ijepa_rae oracle --device mps --cache artifacts/ijepa_features_320_m3/val.pt --num-images 8 --output artifacts/ijepa_rae/oracle.png
-
-.venv/bin/python -m scripts.ijepa_rae prepare --device mps --train-limit 2048 --val-limit 64
-.venv/bin/python -m scripts.ijepa_rae train --device mps --feature-source predictor --out-dir artifacts/ijepa_rae/predictor_ridge
-.venv/bin/python -m scripts.ijepa_rae train --device mps --feature-source target --out-dir artifacts/ijepa_rae/target_ridge
-.venv/bin/python -m scripts.ijepa_rae sample --device mps --cache artifacts/ijepa_rae/features/val.pt --adapter artifacts/ijepa_rae/predictor_ridge/best.pt --target-adapter artifacts/ijepa_rae/target_ridge/best.pt --num-images 8 --output artifacts/ijepa_rae/comparison.png
-```
-
-The matched nonlinear experiment adds a 256-channel GELU residual, initially
-zero, to the fitted ridge projection. Only this small residual is optimized;
-the ridge and both image backbones remain frozen. `--normalize-output` is an
-explicit, checkpointed per-token LayerNorm ablation, not a change to old adapters:
-
-```shell
-.venv/bin/python -m scripts.ijepa_rae train --device mps --feature-source predictor --hidden-dim 256 --steps 800 --out-dir artifacts/ijepa_rae/predictor_mlp256
-.venv/bin/python -m scripts.ijepa_rae train --device mps --feature-source target --hidden-dim 256 --steps 800 --out-dir artifacts/ijepa_rae/target_mlp256
-.venv/bin/python -m scripts.ijepa_rae sample --device mps --cache artifacts/ijepa_rae/features/val.pt --adapter artifacts/ijepa_rae/predictor_mlp256/best.pt --target-adapter artifacts/ijepa_rae/target_mlp256/best.pt --num-images 8 --output artifacts/ijepa_rae/comparison_mlp256.png
-
-.venv/bin/python -m scripts.ijepa_rae train --device mps --feature-source predictor --hidden-dim 256 --normalize-output --steps 800 --out-dir artifacts/ijepa_rae/predictor_mlp256_ln
-.venv/bin/python -m scripts.ijepa_rae train --device mps --feature-source target --hidden-dim 256 --normalize-output --steps 800 --out-dir artifacts/ijepa_rae/target_mlp256_ln
-.venv/bin/python -m scripts.ijepa_rae sample --device mps --cache artifacts/ijepa_rae/features/val.pt --adapter artifacts/ijepa_rae/predictor_mlp256_ln/best.pt --target-adapter artifacts/ijepa_rae/target_mlp256_ln/best.pt --num-images 8 --output artifacts/ijepa_rae/comparison_mlp256_ln.png
-```
-
-The asset command pins both Hugging Face revisions and checks the decoder's
-SHA-256. DINOv2 uses ImageNet-normalized RGB in [0,1], excludes CLS and four
-register tokens, and removes the final LayerNorm affine parameters as required
-by the released RAE checkpoint. Its signed patch features must not be pooled,
-L2-normalized, or passed through the old ResNet adapter's ReLU. No Stage 2 DiT
-model or diffusion sampler is loaded.
-
-On PyTorch 2.7 MPS, antialiased positional interpolation is unavailable. The
-encoder therefore precomputes the exact upstream 224-pixel positional
-interpolation on CPU before moving to MPS; it does not enable global CPU
-fallback. The true-DINO oracle reconstructed eight held-out hidden crops with
-RGB MAE 0.047 on [0,1] pixels; encoder-plus-decoder inference took 1.9 seconds,
-excluding model loading. These are ground-truth-conditioned controls, not
-predictor results.
-
-Preparation selects distinct original photographs from the existing expanded
-caches, preserves their boxes and pixel hashes, and verifies that changing
-hidden pixels leaves the real predictor's unpooled tokens unchanged. Both
-spatial adapters use training-only statistics and a streamed float64 ridge
-solve on CPU. Cache storage is float16; inference is float32 on MPS. Extracting
-2,048 training and 64 validation examples took 269 seconds. The matched
-800-step residual fits took about 22 seconds each while running together.
-
-The comparison labels **DINOv2 oracle** and **IJEPA target** identify controls
-that see hidden RGB. **Via target** instead feeds predictor tokens through the
-target-trained adapter. The primary **predictor** and its in-context composite
-use only predictor tokens. **Wrong predictor** changes the source photograph;
-**shuffled tokens** keeps the same token mean but changes their spatial order.
-
-On all 64 validation photographs, with feature MSE standardized by the
-training-only DINO channel scales:
-
-| Source and adapter | Feature MSE | Token cosine | Wrong-photo MSE |
-|---|---:|---:|---:|
-| Predictor, mean tokens (no output LayerNorm) | 0.993 | 0.467 | 0.993 |
-| Predictor, ridge | 0.821 | 0.614 | 1.218 |
-| Predictor, residual MLP | 0.800 | 0.627 | 1.239 |
-| True I-JEPA target, residual MLP | 0.771 | 0.645 | 1.291 |
-| Predictor, residual MLP + output LayerNorm | 0.838 | 0.590 | 1.316 |
-| True I-JEPA target, residual MLP + output LayerNorm | 0.808 | 0.615 | 1.386 |
-
-The first eight validation images gave predictor RGB MAE 0.165 for ridge,
-0.163 for the residual, and 0.152 for the normalized residual; the corresponding
-true-I-JEPA-target control reached 0.137 and the true-DINO oracle 0.047.
-These pixel errors are diagnostics on eight examples, not semantic-quality
-scores or proof that predictor uncertainty has been resolved. Output
-normalization helped RGB error here despite worse feature metrics.
-`artifacts/ijepa_rae/results.json` records these measurements and controls.
-
-**Outcome:** native DINO tokens reconstruct detailed crops, but mapped I-JEPA
-tokens still produce blurred shapes and colors, often with grid texture.
-The headset outline and broad background layout are partially retained;
-truck details, the chainsaw, and fine structure are not recovered reliably.
-Even the adapter fed true target-encoder tokens remains blurry, so the
-cross-encoder/spatial bridge is already a bottleneck before predictor
-uncertainty is considered. The residual and output normalization did not
-establish a qualitative improvement over the earlier DINO-RCDM route.
-Wrong-image and shuffled-token controls visibly alter the result; all three
-comparisons preserve visible pixels exactly outside the mask.
-
-The follow-up controls below separate spatial resolution from cross-encoder
-mapping before investing in a learned upsampler or a native I-JEPA decoder.
-The pilot does not require rented GPUs; its current limitation is
-reconstruction quality, not Mac inference speed.
-
-### Spatial and Nearest-Crop Diagnostics
-
-These experiments require no new training or dataset. They evaluate all 64
-held-out photographs and show the first eight, matching the earlier grids:
-
-```shell
-.venv/bin/python -m scripts.ijepa_diagnostics spatial-oracle --device mps --output artifacts/ijepa_diagnostics/spatial_oracle.png
-.venv/bin/python -m scripts.ijepa_diagnostics retrieve --device cpu --output artifacts/ijepa_diagnostics/retrieval.png
-```
-
-The spatial oracle uses real hidden-crop DINOv2 tokens, never predictor
-outputs. It compares the native 16x16 grid with downsampling to 7x7 and
-bilinear upsampling, optional per-token LayerNorm, and a closest representable
-7x7 grid computed by CPU float64 QR. This last control minimizes token MSE,
-not RGB error; it is not an upper bound on possible reconstruction quality.
-The LayerNorm controls are not constrained to the linear interpolation subspace.
-
-| Input to frozen RAE decoder | RGB MAE, 64 images | Token cosine |
-|---|---:|---:|
-| Native DINOv2 tokens | 0.052 | 1.000 |
-| Resize 16x16 to 7x7 to 16x16 | 0.096 | 0.906 |
-| Resize + output LayerNorm | 0.095 | 0.906 |
-| Closest representable 7x7 grid | 0.089 | 0.922 |
-| Closest grid + output LayerNorm | 0.088 | 0.922 |
-| Mean DINO token repeated everywhere | 0.177 | 0.759 |
-
-Resolution reduction visibly blurs fine details, but truck fronts, headset
-outlines, horn curves, and broad layout remain recognizable. On the exact
-first eight images, native DINO gives RGB MAE 0.047, simple resizing 0.086,
-and the closest grid with LayerNorm 0.078, versus 0.137 for the earlier mapped
-I-JEPA target control and 0.152 for its predictor. Spatial interpolation
-therefore contributes to the problem but does not explain the entire bridge
-failure. All these pixel errors use [0,1] RGB and are not semantic-quality
-scores.
-
-Retrieval compares pooled predictor outputs with true target-encoder
-features from the existing bank of 28,407 crops / 9,469 training photographs.
-It searches exact cosine similarity without FAISS or CUDA. Neighbor sets
-contain distinct original-photo pixel hashes, even though the bank has three
-masks per photograph; train/query pixel-hash overlap is rejected.
-Centering subtracts only the training target-bank mean before normalization.
-The command writes both `retrieval.png` and `retrieval_centered.png`, with
-top-three real crops, native-mask composites, target-oracle neighbors, and
-wrong-photo predictor controls. Corresponding `.json` / `.pt` files retain
-the source paths, boxes, similarities, indices, and measurements.
-
-| Retrieval query | Top-1 neighbor from the same original-photo class |
-|---|---:|
-| Predictor, cosine | 59/64 |
-| Predictor, centered cosine | 62/64 |
-| True target encoder, cosine | 62/64 |
-| True target encoder, centered cosine | 62/64 |
-| Wrong-photo predictor, either metric | 5/64 |
-
-Predictor and actual target pooled vectors have mean cosine 0.964. With plain
-cosine they choose the identical training crop in 46/64 cases. The first
-eight grids show relevant truck, dog/paw, audio-equipment, horn, and chainsaw
-neighbors; the wrong-photo control changes their content. All 128 raw and
-centered composites preserve pixels outside the native mask exactly.
-
-**Limitations:** retrieval copies real training crops; it does not generate a
-new reconstruction or reveal the unique hidden RGB. Imagenette classes label
-whole photographs, not their masked regions. Matching that class does not
-establish correct local content, pose, colors, or alignment, and a background
-mask can retrieve foreground from the same class. These are ten-class,
-image-disjoint diagnostics, not a claim of general predictor accuracy.
-Held out here means separate from our adapter training and retrieval bank;
-Imagenette's ImageNet origin does not guarantee separation from frozen
-encoder pretraining.
-
-**Outcome:** both requested diagnostics were informative, so the conditional
-native decoder fallback was not started during that stage. Predictor features select
-meaningful real neighbors even when the learned RAE bridge produces blur;
-that bridge should not be used alone to judge what the predictor represents.
-
-### Native I-JEPA Reconstruction Pilot
-
-This continuation removes the DINO bridge. A trainable decoder receives only
-the 7x7 I-JEPA patch tokens and their known positions in the native 16x16 grid.
-It initializes transformer blocks from the pinned `facebook/vit-mae-base`
-decoder, with a new 1280-to-512 input projection, native fixed position
-embeddings, and an RGB head resized from 16-pixel to 14-pixel patches.
-The MAE encoder is not used. The CLS-like input is a mean of normalized
-I-JEPA patch tokens, not an unavailable I-JEPA CLS token.
-
-Training uses the existing 2,048/64 spatial caches, but RGB targets are the
-original **98x98** masked crops, not their upscaled 256x256 RAE versions.
-The objective is raw RGB L1 + 0.5 frozen AlexNet LPIPS. RGB denormalization
-uses fixed ImageNet statistics; no hidden-patch color statistics or hidden
-RGB enter predictor inference. A training-only mean crop supplies the
-validation baseline. Encoders remain frozen, and train/validation pixel-hash
-overlap and incompatible feature/checkpoint contracts are rejected.
-
-```shell
-.venv/bin/python -m pip install -e '.[native]'
-.venv/bin/python -m scripts.ijepa_native assets
-.venv/bin/python -m scripts.ijepa_native train --device mps --feature-source target --steps 1000 --out-dir artifacts/ijepa_native/target_1000
-.venv/bin/python -m scripts.ijepa_native train --device mps --feature-source mixed --steps 800 --learning-rate 5e-5 --init artifacts/ijepa_native/target_1000/best.pt --out-dir artifacts/ijepa_native/mixed_800
-.venv/bin/python -m scripts.ijepa_native sample --device mps --target-decoder artifacts/ijepa_native/target_1000/best.pt --decoder artifacts/ijepa_native/mixed_800/best.pt --output artifacts/ijepa_native/comparison.png
-```
-
-The target-token stage is an oracle that sees hidden RGB through the frozen
-target encoder. The mixed continuation alternates target and predictor
-examples within each batch and selects checkpoints by held-out predictor
-reconstruction. `--init` starts a new optimization run from weights; it is
-not an optimizer-state resume. Each experiment needs a new output directory.
-The comparison includes both decoders' target controls, predictor before and
-after adaptation, an exact native-mask composite, wrong-photo conditioning,
-and a permutation that preserves the predictor token mean.
-
-These are **deterministic learned reconstructions**, not RCDM samples or
-retrieved training crops. They cannot establish the unique hidden image.
-Native 98x98 errors are not directly comparable with earlier 256x256 RAE
-errors without evaluating both on the same RGB target and resolution.
-
-**Measured MPS run:** the target stage took 118 seconds; mixed continuation
-took 95 seconds, including periodic validation and checkpoint writes.
-The decoder has 26.3 million parameters. Predictor validation selected step
-400, not the final step 800. On all 64 held-out photographs:
-
-| Decoder input | RGB MAE | AlexNet LPIPS |
-|---|---:|---:|
-| Training-only mean-crop baseline | 0.243 | 0.912 |
-| Target tokens, target-trained decoder | 0.101 | 0.232 |
-| Predictor tokens, target-trained decoder | 0.134 | 0.368 |
-| Target tokens, mixed decoder | 0.097 | 0.216 |
-| Predictor tokens, mixed decoder | 0.128 | 0.336 |
-| Wrong-photo predictor, mixed decoder | 0.300 | 0.697 |
-| Shuffled predictor tokens, mixed decoder | 0.197 | 0.526 |
-
-For a fair cross-decoder comparison, the existing RAE outputs for the same
-first eight photographs were downsampled on CPU to 98x98 using antialiased
-bilinear interpolation. Both methods were scored against the same original
-hidden RGB crops, with rendered [0,1] RGB:
-
-| Method, first eight photographs | RGB MAE | AlexNet LPIPS |
-|---|---:|---:|
-| RAE, true DINOv2 oracle | 0.045 | 0.072 |
-| RAE, mapped I-JEPA target tokens | 0.137 | 0.480 |
-| Native decoder, I-JEPA target tokens | 0.095 | 0.249 |
-| RAE, mapped predictor tokens | 0.153 | 0.599 |
-| Native predictor before adaptation | 0.123 | 0.325 |
-| Native predictor after adaptation | 0.123 | 0.305 |
-
-`artifacts/ijepa_native/comparison.png` shows the first eight; the primary
-columns are **native predictor** and **in context**. The truck front, headset
-contour, horn bell, and orange chainsaw body are more recognizable than in
-the mapped RAE pilot. Geometry, texture, colors, and seams remain imperfect.
-All eight composites preserve visible pixels exactly.
-`results.json` and `matched_rae_controls.json` retain the measurements.
-
-**Outcome:** direct decoding is a meaningful improvement over the DINO
-bridge; adaptation adds a modest gain rather than another qualitative jump.
-Wrong-photo conditioning changes content, and shuffling worsens spatial
-reconstruction despite preserving the token mean. The target oracle is still
-better than predictor decoding, and true-DINO reconstruction remains better
-than either I-JEPA route. These results do not separate irreducible predictor
-uncertainty from remaining decoder/data limitations. The ten-class,
-2,048-photo training set and fixed 7x7 mask geometry also limit transfer:
-larger rectangular paper masks require explicit geometry transfer, not an
-interchangeable checkpoint. More identical-data mixed-training steps did not
-clearly improve validation after step 400; rented GPUs are not needed to run
-this pilot.
-
-## Sample Using PyCharm on macOS with Remote Linux Interpreter
-
-```shell
-# Run the below commands on the Linux machine.
-# Tested with "Linux pop-os 6.9.3-76060903-generic #202405300957~1726766035~22.04~4092a0e SMP PREEMPT_DYNAMIC Thu S x86_64 x86_64 x86_64 GNU/Linux" and "conda 25.11.1".
-
-conda create -n rcdm python=3.12
-conda activate rcdm
-
-# Taken from https://pytorch.org/get-started/locally/, to pick CUDA version check it with `nvidia-smi` command.
-# Or, actually, that's probably not the real CUDA version, see https://stackoverflow.com/a/55717476/1862286.
-pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-
-mkdir ~/rcdm
-cd ~/rcdm
-# Create a new Conda SSH interpreter in PyCharm and specify the newly created as the target of "Sync folders" while creating your SSH interpreter in PyCharm
-pip install -e .
-
-# Note: Make sure that the `/home/yaskovdev/rcdm_images` contains at least one image, otherwise sampling will get stuck.
-python scripts/image_sample.py --attention_resolutions 32,16,8 --class_cond False --diffusion_steps 1000 --image_size 128 --learn_sigma True --noise_schedule linear --num_channels 256 --num_heads 4 --num_res_blocks 2 --resblock_updown True --use_fp16 False --use_scale_shift_norm True --batch_size 8 --num_images 1 --timestep_respacing 100 --data_dir "/home/yaskovdev/rcdm_images" --type_model supervised
-```
-
-You can then run `scp yaskovdev@192.168.1.186:/home/yaskovdev/rcdm/samples.jpeg ~/Downloads/rcdm_samples` on macOS.
-
-# Train Using PyCharm on macOS with Remote Linux Interpreter
-
-Download the dataset: https://www.kaggle.com/datasets/thbdh5765/ilsvrc2012/data.
-
-Extract the archive to a `/home/yaskovdev/images` folder.
-
-```shell
-# Run the below commands on the Linux machine.
-cd ~/rcdm
-conda activate rcdm
-
-export MODEL_FLAGS_128="--attention_resolutions 32,16,8 --class_cond False --diffusion_steps 1000 --image_size 128 --learn_sigma True --noise_schedule linear --num_channels 256 --num_heads 4 --num_res_blocks 2 --resblock_updown True --use_fp16 False --use_scale_shift_norm True"
-export TRAIN_FLAGS="--lr 1e-4 --batch_size 8 --save_interval 5000"
-
-# Train on a PC with 2 GPUs:
-torchrun --nproc_per_node=2 scripts/image_train.py $MODEL_FLAGS_128 $TRAIN_FLAGS --feat_cond --data_dir /home/yaskovdev/images --type_model dino --out_dir /home/yaskovdev/save_dir_128
-
-# To resume an interrupted run, add --resume_checkpoint /home/yaskovdev/save_dir_128/model050000.pt to the training command, using your actual checkpoint path.
-
-# Sample from the trained model:
-python scripts/image_sample.py $MODEL_FLAGS_128 --batch_size 8 --num_images 1 --timestep_respacing 100 --data_dir "/home/yaskovdev/rcdm_images" --model_path /home/yaskovdev/save_dir_128/model090000.pt --type_model dino
-```
-
-## Sample on Windows
-
-```powershell
-# Start Anaconda Prompt (tested with Miniconda 23.7.4)
-
-conda create -n rcdm python=3.12
-conda activate rcdm
-
-# Taken from https://pytorch.org/get-started/locally/, to pick CUDA version check it with `nvidia-smi` command
-pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-
-cd C:\dev\git_home\RCDM
-pip install -e .
-
-python scripts/image_sample.py --attention_resolutions 32,16,8 --class_cond False --diffusion_steps 1000 --image_size 128 --learn_sigma True --noise_schedule linear --num_channels 256 --num_heads 4 --num_res_blocks 2 --resblock_updown True --use_fp16 False --use_scale_shift_norm True --batch_size 8 --num_images 1 --timestep_respacing 100 --data_dir "c:\dev\rcdm_images_3" --type_model supervised
-```
-
-Tried with `--type_model dino` as well.
-
-# Train on Windows
-
-```powershell
-# Start Anaconda Prompt (tested with Miniconda 23.7.4)
-
-python scripts/image_train.py
-```
-
-# Representation Conditional Diffusion Model (RCDM)
-
-![RCDM's samples of earth](images/RCDM_front.png?raw=true "samples earth")
-
-This is the codebase for [High Fidelity Visualization of What Your Self-Supervised Representation Knows About](https://arxiv.org/abs/2112.09164)
-
-This repo is a fork of the github repository [guided-diffusion](https://github.com/openai/guided-diffusion) which is the codebase for [Diffusion Models Beat GANS on Image Synthesis](http://arxiv.org/abs/2105.05233).
-
-Instead of using the gradient of a classifier to guide the sampling, our model uses the features of supervised or self-supervised models as conditioning.
-
-# How to install
-
-Create a new conda environement
-```
-conda create --name RCDM python=3.9
-conda activate RCDM
-```
-Clone this repository, navigate to it, then run:
-```
-pip install -e .
-```
-
-# Repository structure
-All the training and sampling scripts are located in scripts/. The SSL models that we used to compute the representations from are defined in the file ./guided_diffusion_rcdm/get_ssl_models.py. The links of the pretrained RCDM models are located in ./guided_diffusion/get_rcdm_models.py.
-
-## Model FLAGS used in this repository
-All model availables through this repository were trained on a resolution of 128x128 pixels. In order to use the pretrained models, you'll need to export these following FLAGS:
-```
-export MODEL_FLAGS_128="--attention_resolutions 32,16,8 --class_cond False --diffusion_steps 1000 --image_size 128 --learn_sigma True --noise_schedule linear --num_channels 256 --num_heads 4 --num_res_blocks 2 --resblock_updown True --use_fp16 False --use_scale_shift_norm True"
-export TRAIN_FLAGS="--lr 1e-4 --batch_size 8"
-```
-
-If you don't want to use the pretrained models, you can use the FLAGS used in the original github repository [guided-diffusion](https://github.com/openai/guided-diffusion) to train RCDM in 64x64 or 256x256.
-
-# Training RCDM with self-supervised representations
-We use submitit to run the distributed training accross several nodes. You'll probably need to adapt the file run_with_submitit.py depending on your cluster configuration. The command below run an RCDM training over the features extracted from Dino (you can change the feature extractor by changing the --type_model argument or by updating the file ./guided_diffusion/get_ssl_models.py).
-```
-python run_with_submitit.py --nodes 4 --ngpus 8 --use_volta32 $MODEL_FLAGS_128 $TRAIN_FLAGS --feat_cond --data_dir DATASET_DIR --type_model dino --out_dir SAVE_DIR
-```
-
-# Use a pretrained model
-
-To use any of the following pretrained models, you will need to install vissl:
-```
-pip install vissl
-```
-
-This repository comes with a set of model that were pretrained on ImageNet (please note that even if the code is released under the MIT licence, the weights of the model are only available under the [CC-BY-NC license](https://dl.fbaipublicfiles.com/rcdm/LICENSE)).  The models will be automatically downloaded when using any of the sampling scripts. However, you can also download them manually from the following links:
-
-| Model | SSL Model | Type (Trunk/Head) | url |
-|-------------------|-------------------|-------------------|---------------------|
-| RCDM | SimCLR | Trunk | [model](https://dl.fbaipublicfiles.com/rcdm/rcdm_ema_simclr_trunk.pt) | 
-| RCDM | SimCLR | Head | [model](https://dl.fbaipublicfiles.com/rcdm/rcdm_ema_simclr_head.pt) | 
-| RCDM | Barlow Twins | Trunk | [model](https://dl.fbaipublicfiles.com/rcdm/rcdm_ema_barlow_trunk.pt) | 
-| RCDM | Barlow Twins | Head | [model](https://dl.fbaipublicfiles.com/rcdm/rcdm_ema_barlow_head.pt) | 
-| RCDM | VICReg | Trunk | [model](https://dl.fbaipublicfiles.com/rcdm/rcdm_ema_vicreg_trunk.pt) | 
-| RCDM | VICReg | Head | [model](https://dl.fbaipublicfiles.com/rcdm/rcdm_ema_vicreg_head.pt) | 
-| RCDM | Dino | Trunk | [model](https://dl.fbaipublicfiles.com/rcdm/rcdm_ema_dino_trunk.pt) | 
-| RCDM | Dino | Head | [model](https://dl.fbaipublicfiles.com/rcdm/rcdm_ema_dino_head.pt) | 
-| RCDM | Supervised | N/A | [model](https://dl.fbaipublicfiles.com/rcdm/rcdm_ema_supervised.pt) | 
-
-# Conditional sampling with RCDM
-![RCDM's sampling with different SSL representations](images/samples.jpeg?raw=true "sampling")
-
-To sample from these models, you can use the `image_sample.py` script. You need to replace DATA_PATH by the directory in which the images that will be used to compute the ssl representations are saved. The num_images parameters indicates how many images in the directory DATA_PATH you want to use. The type_model parameters indicates which SSL model to use as feature extractor. You can add --model_path to specify which RCDM checkpoints to use (Otherwise, one of the pretrained model will be downloaded automatically). You can use the argument --use_head to use the head instead of the trunk as feature extrator. The command bellow will generated 16 samples, with 8 samples par images in the DATA_PATH directory by using the representation given by Barlow Twins.
-
-```
-python scripts/image_sample.py $MODEL_FLAGS_128 --batch_size 8 --num_images 2 --timestep_respacing 100 --data_dir DATA_PATH --type_model barlow
-```
-
-## Interpolation of two images
-![RCDM's sampling with interpolation](images/interpolation.jpeg?raw=true "interpolation")
-
-To interpolate between the representations of two images, you can use the `image_sample_interpolation.py` script.
-Replace MODEL_PATH by the relevant model checkpoint (or leave blank to use the pretrained model) and FIRST_IMAGE_PATH/SECOND_IMAGE_PATH by the path of the images you want to interpolate in the ssl representation space.
-
-```
-python scripts/image_sample_interpolation.py $MODEL_FLAGS_128 --batch_size 8 --timestep_respacing 100 --type_model barlow --first_image_path FIRST_IMAGE_PATH --second_image_path SECOND_IMAGE_PATH
-```
-
-## Manipulation of representations
-![RCDM's manipulation of representations](images/manipulation.jpeg?raw=true "Dog's clothes")
-
-To manipulate representations, you can use the `image_sample_manipulation.py` script.
-Replace MODEL_PATH by the relevant model checkpoint, IMAGE_PATH by the path of the images you want to extract the attributes from, NN_PATH by the folder's path of the images in which to find the nearest neigbors and TARGET_PATH by the path of the image on which to apply the attribute on.
-
-```
-python scripts/image_sample_manipulation.py $MODEL_FLAGS_128 --batch_size 8 --timestep_respacing 100 --dist --type_model simclr --image_path IMAGE_PATH --folder_nn_path NN_PATH --image_target_path TARGET_PATH
-```
-
-If you want to reproduce the image above, just use:
-```
-python scripts/image_sample_manipulation.py $MODEL_FLAGS_128 --batch_size 8 --timestep_respacing 100 --type_model simclr  --image_path IMAGENET_PATH/val/n02099601/ILSVRC2012_val_00027833.JPEG --folder_nn_path IMAGENET_PATH/val/n02099601/ --image_target_path IMAGENET_PATH/val/n02099601/ILSVRC2012_val_00001123.JPEG
-```
-
-# LICENSE
-The code is distributed under the MIT license. However the weights of the pretrained models that are available for download are under the CC-BY-NC license and should not be use for commercial purpose.
-
-# Cite the paper
-```
-@article{
-      bordes2022high,
-      title={High Fidelity Visualization of What Your Self-Supervised Representation Knows About},
-      author={Florian Bordes and Randall Balestriero and Pascal Vincent},
-      journal={Transactions on Machine Learning Research},
-      year={2022},
-      url={https://openreview.net/forum?id=urfWb7VjmL},
-      note={}
-}
+The focused tests use synthetic data and small models without model downloads.
+This standalone project retains the git history and original MIT notices from
+[RCDM](https://github.com/facebookresearch/RCDM) /
+[OpenAI guided-diffusion](https://github.com/openai/guided-diffusion);
+unrelated experiment code is absent from the current tree.
+
+**Code: [MIT](LICENSE). Released model weights: CC-BY-NC 4.0.**
+Official [I-JEPA code/weights](https://github.com/facebookresearch/ijepa/blob/main/LICENSE)
+also remain CC-BY-NC 4.0. The pinned
+[MAE model card](https://huggingface.co/facebook/vit-mae-base/blob/25b184bea5538bf5c4c852c79d221195fdd2778d/README.md)
+lists Apache-2.0. This I-JEPA-based workflow is for noncommercial research;
+the code license does not relicense models or
+[Imagenette/ImageNet](https://github.com/fastai/imagenette) photographs.
+
+Related papers: [I-JEPA](https://arxiv.org/abs/2301.08243),
+[MAE](https://arxiv.org/abs/2111.06377), [RCDM](https://arxiv.org/abs/2112.09164).

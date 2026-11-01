@@ -5,7 +5,7 @@ import torch as th
 from torch import nn
 from torch.nn import functional as F
 
-from .rae import file_sha256
+from .io import file_sha256
 
 
 MAE_MODEL = "facebook/vit-mae-base"
@@ -108,7 +108,7 @@ def load_image_prior(assets, input_dim, source_shape):
     processor = json.loads(Path(assets["processor"]).read_text())
     if (config["norm_pix_loss"] or processor["image_mean"] != [0.485, 0.456, 0.406]
             or processor["image_std"] != [0.229, 0.224, 0.225]):
-        raise ValueError("Native RGB decoding requires the released fixed ImageNet normalization, not hidden patch stats.")
+        raise ValueError("Native decoding requires fixed ImageNet normalization, not hidden patch statistics.")
     model = NativeDecoder(input_dim, source_shape, config)
     with safe_open(assets["checkpoint"], framework="pt", device="cpu") as weights:
         source = {name.removeprefix("decoder."): weights.get_tensor(name)
@@ -127,3 +127,27 @@ def load_image_prior(assets, input_dim, source_shape):
         state[name] = value
     model.decoder.load_state_dict(state, strict=True)
     return model
+
+
+def load_decoder(path, device, expected_spec=None, freeze=True):
+    from safetensors.torch import load_file
+
+    path = Path(path)
+    if path.is_dir():
+        metadata = json.loads((path / "config.json").read_text())
+        state = load_file(str(path / "model.safetensors"), device="cpu")
+    else:
+        metadata = th.load(path, map_location="cpu", weights_only=True)
+        state = metadata["state_dict"]
+    spec = metadata["input_spec"]
+    if (metadata["initialization"] != initialization_spec()
+            or metadata["feature_source"] not in ("target", "predictor", "mixed")
+            or spec["target_normalization"] != "layer_norm_patch_tokens"
+            or spec["output"] != "native_rgb_patch14_fixed_imagenet"
+            or (expected_spec is not None and spec != expected_spec)):
+        raise ValueError("Decoder differs in frozen I-JEPA, geometry, normalization, or image prior.")
+    model = NativeDecoder(spec["feature_dim"], spec["shape"], metadata["config"])
+    model.load_state_dict(state, strict=True)
+    if freeze:
+        model.eval().requires_grad_(False)
+    return model.to(device), metadata

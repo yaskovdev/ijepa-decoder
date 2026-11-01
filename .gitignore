@@ -5,6 +5,9 @@ classify_image_graph_def.pb
 *.egg-info/
 /.venv/
 /artifacts/
+/build/
+/dist/
+*.pyc
 
 /log.txt
 /progress.csv

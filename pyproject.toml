@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ijepa-decoder"
+version = "0.1.0"
+description = "Unofficial native I-JEPA predictor-to-RGB decoder"
+requires-python = ">=3.11"
+license = {file = "LICENSE"}
+readme = "README.md"
+dependencies = [
+    "torch>=2.7,<2.8",
+    "torchvision>=0.22,<0.23",
+    "transformers>=4.51,<5",
+    "huggingface_hub>=0.30,<1",
+    "safetensors>=0.5",
+    "numpy",
+    "Pillow",
+]
+
+[project.optional-dependencies]
+train = ["lpips>=0.1.4,<0.2"]
+
+[project.scripts]
+ijepa-decoder = "ijepa_decoder.cli:main"
+
+[project.urls]
+Repository = "https://github.com/yaskovdev/ijepa-decoder"
+
+[tool.setuptools.packages.find]
+include = ["ijepa_decoder*"]
+
+[tool.setuptools.package-data]
+ijepa_decoder = ["manifest.json", "pretrained.json"]
